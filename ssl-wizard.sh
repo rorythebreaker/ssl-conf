@@ -197,7 +197,7 @@ install_acme() {
     if ! command -v curl &>/dev/null; then
         die "curl is required to install acme.sh."
     fi
-    curl -fsSL https://get.acme.sh | sh -s -- --install-online
+    curl -fsSL https://get.acme.sh | sh
     # Reload shell env so acme.sh is found
     export PATH="${HOME}/.acme.sh:${PATH}"
     if [[ -f "$ACME_SH" ]]; then
@@ -224,19 +224,20 @@ step_method() {
         echo -e "  ${BLUE}  5)${R}  Wildcard — Cloudflare ${DIM}— automated via Cloudflare API token${R}"
         blank
         echo -e "  ${BOLD}${MAGENTA}Self-signed  ${DIM}(openssl — dev / internal use)${R}"
-        echo -e "  ${BLUE}  6)${R}  RSA                   ${DIM}— choose key size: 2048 / 3072 / 4096${R}"
-        echo -e "  ${BLUE}  7)${R}  ECDSA                 ${DIM}— choose curve: P-256 / P-384 / P-521${R}"
-        echo -e "  ${BLUE}  8)${R}  Ed25519               ${DIM}— modern, fixed key size${R}"
-        echo -e "  ${BLUE}  9)${R}  Local CA + signed     ${DIM}— install CA once, trust all internal certs${R}"
+        echo -e "  ${BLUE}  6)${R}  Simple — no passphrase ${DIM}— genrsa → CSR → x509, minimal steps${R}"
+        echo -e "  ${BLUE}  7)${R}  RSA                    ${DIM}— choose key size: 2048 / 3072 / 4096${R}"
+        echo -e "  ${BLUE}  8)${R}  ECDSA                  ${DIM}— choose curve: P-256 / P-384 / P-521${R}"
+        echo -e "  ${BLUE}  9)${R}  Ed25519                ${DIM}— modern, fixed key size${R}"
+        echo -e "  ${BLUE} 10)${R}  Local CA + signed      ${DIM}— install CA once, trust all internal certs${R}"
         blank
         echo -e "  ${BOLD}${WHITE}Utilities${R}"
-        echo -e "  ${BLUE} 10)${R}  Generate key / random ${DIM}— RSA / ECDSA / Ed25519 / random bytes${R}"
+        echo -e "  ${BLUE} 11)${R}  Generate key / random  ${DIM}— RSA / ECDSA / Ed25519 / random bytes${R}"
         blank
         echo -e "  ${RED}  0)${R}  Exit"
         blank; hr; blank
 
         local choice
-        printf "  Select [0-10]: "
+        printf "  Select [0-11]: "
         read -r choice
         case "$choice" in
             1)  S_METHOD="le_standalone";      return 0 ;;
@@ -244,11 +245,12 @@ step_method() {
             3)  S_METHOD="le_nginx";           return 0 ;;
             4)  S_METHOD="le_wildcard_manual"; return 0 ;;
             5)  S_METHOD="le_wildcard_cf";     return 0 ;;
-            6)  S_METHOD="ss_rsa";             return 0 ;;
-            7)  S_METHOD="ss_ecdsa";           return 0 ;;
-            8)  S_METHOD="ss_ed25519";         return 0 ;;
-            9)  S_METHOD="ss_ca";              return 0 ;;
-            10) S_METHOD="keygen";             return 0 ;;
+            6)  S_METHOD="ss_simple";          return 0 ;;
+            7)  S_METHOD="ss_rsa";             return 0 ;;
+            8)  S_METHOD="ss_ecdsa";           return 0 ;;
+            9)  S_METHOD="ss_ed25519";         return 0 ;;
+            10) S_METHOD="ss_ca";              return 0 ;;
+            11) S_METHOD="keygen";             return 0 ;;
             0)  info "Exiting."; exit 0 ;;
             *)  warn "Invalid choice." ;;
         esac
@@ -259,7 +261,7 @@ step_method() {
 # STEP 2 — Output format  (skip for keygen)
 # ==============================================================================
 step_format() {
-    [[ "$S_METHOD" == "keygen" ]] && return 0
+    [[ "$S_METHOD" == "keygen" || "$S_METHOD" == "ss_simple" ]] && return 0
     while true; do
         banner
         echo -e "  ${BOLD}Step 2 of 5${R} — Output file format"
@@ -290,7 +292,7 @@ step_format() {
 # STEP 3 — Variables
 # ==============================================================================
 step_variables() {
-    [[ "$S_METHOD" == "keygen" ]] && return 0
+    [[ "$S_METHOD" == "keygen" || "$S_METHOD" == "ss_simple" ]] && return 0
     while true; do
         banner
         echo -e "  ${BOLD}Step 3 of 5${R} — Certificate details"
@@ -374,8 +376,47 @@ step_variables() {
 }
 
 # ==============================================================================
-# STEP 3 (keygen) — Key generator parameters
+# STEP 3 (ss_simple) — Simple self-signed parameters: RSA bits + validity
+# STEP 3 (keygen)   — Key generator parameters
+# Unified dispatcher called from main
 # ==============================================================================
+step_simple_or_keygen_params() {
+    if [[ "$S_METHOD" == "ss_simple" ]]; then
+        # -- RSA key size -------------------------------------------------------
+        while true; do
+            banner
+            echo -e "  ${BOLD}Step 3 of 5${R} — Simple self-signed: RSA key size"
+            hr; blank
+            echo -e "  ${BLUE}  1)${R}  2048 bits  ${DIM}— fast, minimum recommended${R}"
+            echo -e "  ${BLUE}  2)${R}  3072 bits  ${DIM}— balanced${R}"
+            echo -e "  ${BLUE}  3)${R}  4096 bits  ${DIM}— strongest, slower${R}"
+            blank; hr; blank
+            local rs
+            menu_pick rs "2048" "3072" "4096" || { NAV="back"; return 1; }
+            case "$rs" in
+                1) S_RSA_BITS="2048"; break ;;
+                2) S_RSA_BITS="3072"; break ;;
+                3) S_RSA_BITS="4096"; break ;;
+            esac
+        done
+
+        # -- Domain / IP --------------------------------------------------------
+        banner
+        echo -e "  ${BOLD}Step 3 of 5${R} — Simple self-signed: domain / IP"
+        hr; blank
+        ask S_DOMAIN "Domain or IP address" || { NAV="back"; return 1; }
+
+        # -- Validity -----------------------------------------------------------
+        ask S_DAYS "Validity in days" "365" || { NAV="back"; return 1; }
+
+        NAV=""
+        return 0
+    fi
+
+    # Delegate to keygen flow
+    step_keygen_params
+}
+
 step_keygen_params() {
     while true; do
         banner
@@ -710,6 +751,27 @@ run_le_wildcard_cf() {
 }
 
 # ==============================================================================
+# Run: simple self-signed — no passphrase (genrsa → CSR → x509)
+# ==============================================================================
+run_ss_simple() {
+    info "Step 1/3 — Generating RSA ${S_RSA_BITS} private key (no passphrase)…"
+    openssl genrsa         -out "${S_OUTDIR}/privkey.pem"         "${S_RSA_BITS}"
+    chmod 600 "${S_OUTDIR}/privkey.pem"
+    ok "key  : ${S_OUTDIR}/privkey.pem"
+    blank
+
+    info "Step 2/3 — Generating Certificate Signing Request (CSR)…"
+    openssl req -new         -key "${S_OUTDIR}/privkey.pem"         -out "${S_OUTDIR}/cert.csr"         -subj "/CN=${S_DOMAIN}"
+    ok "CSR  : ${S_OUTDIR}/cert.csr"
+    blank
+
+    info "Step 3/3 — Self-signing certificate (${S_DAYS} days)…"
+    openssl x509 -req         -days   "${S_DAYS}"         -in     "${S_OUTDIR}/cert.csr"         -signkey "${S_OUTDIR}/privkey.pem"         -out    "${S_OUTDIR}/fullchain.pem"
+    ok "cert : ${S_OUTDIR}/fullchain.pem"
+    print_nginx_hint "${S_OUTDIR}/fullchain.pem"                      "${S_OUTDIR}/privkey.pem"
+}
+
+# ==============================================================================
 # Run: self-signed methods
 # ==============================================================================
 run_ss_rsa() {
@@ -916,9 +978,9 @@ main() {
         step_format
         [[ "$NAV" == "back" ]] && continue
 
-        # Step 3 — variables or keygen params
-        if [[ "$S_METHOD" == "keygen" ]]; then
-            step_keygen_params
+        # Step 3 — variables or keygen/simple params
+        if [[ "$S_METHOD" == "keygen" || "$S_METHOD" == "ss_simple" ]]; then
+            step_simple_or_keygen_params
             [[ "$NAV" == "back" ]] && continue
         else
             step_variables
@@ -944,6 +1006,7 @@ main() {
             le_nginx)           run_le_nginx            ;;
             le_wildcard_manual) run_le_wildcard_manual  ;;
             le_wildcard_cf)     run_le_wildcard_cf      ;;
+            ss_simple)          run_ss_simple           ;;
             ss_rsa)             run_ss_rsa              ;;
             ss_ecdsa)           run_ss_ecdsa            ;;
             ss_ed25519)         run_ss_ed25519          ;;

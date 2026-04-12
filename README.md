@@ -1,7 +1,7 @@
 # ssl-wizard.sh
 
 Interactive SSL certificate creation wizard.
-Supports Let's Encrypt via acme.sh, self-signed via openssl, and a standalone key generator.
+Covers Let's Encrypt via acme.sh, self-signed via openssl, and a standalone key / random string generator.
 
 ---
 
@@ -11,12 +11,13 @@ Supports Let's Encrypt via acme.sh, self-signed via openssl, and a standalone ke
 |---|---|---|
 | `bash` 4+ | always | — |
 | `openssl` | always | `apt install openssl` |
-| `curl` | always (acme.sh install) | `apt install curl` |
+| `curl` | acme.sh install | `apt install curl` |
 | `acme.sh` | Let's Encrypt methods | auto-installed by wizard |
-| `socat` | LE standalone mode only | `apt install socat` |
-| `nginx` | LE nginx mode only | `apt install nginx` |
+| `socat` | LE standalone mode | `apt install socat` |
+| `nginx` | LE nginx mode | `apt install nginx` |
 
-> The wizard checks all dependencies at startup and tells you what is missing before doing anything.
+The wizard checks all of these at startup and reports what is missing before doing anything.
+If acme.sh is not found, it offers to install it automatically.
 
 ---
 
@@ -31,173 +32,194 @@ sudo ./ssl-wizard.sh
 
 ## Navigation
 
-- Type a number and press Enter to select an option
-- Type `b` and press Enter at any prompt to go back to the previous step
-- Step 1 (method selection) has no back — type `0` to exit
+| Input | Effect |
+|---|---|
+| number + Enter | select option |
+| `b` + Enter | go back to previous step |
+| `0` + Enter | exit (step 1 only) |
+
+Step 1 has no back — type `0` to exit instead.
 
 ---
 
-## Steps
+## Methods
 
-The wizard walks through 5 steps for certificate methods, or 3 steps for the key generator.
+### Step 1 — choose a method
 
----
+**Let's Encrypt** — free, publicly trusted, valid 90 days, requires a real domain (not an IP):
 
-### Step 1 — Method
-
-**Let's Encrypt** (free, publicly trusted, 90-day certificates):
-
-| # | Method | Requirements |
+| # | Method | What happens |
 |---|---|---|
-| 1 | Standalone | `socat`, port 80 must be free |
-| 2 | Webroot | nginx running, serving `/.well-known/acme-challenge/` |
-| 3 | nginx mode | nginx installed, acme.sh reloads it automatically |
-| 4 | Wildcard — manual DNS | access to your DNS panel to add a TXT record |
-| 5 | Wildcard — Cloudflare | Cloudflare API token |
+| 1 | Standalone | acme.sh binds port 80 directly. Requires `socat`. nginx must not be running on port 80. |
+| 2 | Webroot | nginx stays running. acme.sh writes a challenge file to the webroot you specify. |
+| 3 | nginx mode | acme.sh handles nginx reload automatically. nginx must be installed. |
+| 4 | Wildcard — manual DNS | acme.sh outputs a TXT record value. You add it to DNS manually, then complete issuance. |
+| 5 | Wildcard — Cloudflare | Fully automated via Cloudflare API token. No manual DNS edits needed. |
 
-> Let's Encrypt does not issue certificates for IP addresses. Use a domain name.
+**Self-signed** — openssl, no CA trust, suitable for internal services and development:
 
-**Self-signed** (openssl, no CA trust, suitable for internal/dev use):
-
-| # | Method | Notes |
+| # | Method | What happens |
 |---|---|---|
-| 6 | RSA | choose key size: 2048 / 3072 / 4096 |
-| 7 | ECDSA | choose curve: P-256 / P-384 / P-521 |
-| 8 | Ed25519 | modern algorithm, fixed key size |
-| 9 | Local CA + signed cert | sign multiple certs with one CA |
-
-> Self-signed certificates trigger a browser warning on public sites.
-> For IP addresses, use self-signed — the IP is written as `IP.1` in the SAN automatically.
+| 6 | Simple — no passphrase | Three commands: `genrsa` → `req` → `x509`. Minimal input, no config file. |
+| 7 | RSA | Full self-signed with SAN config. Choose key size. |
+| 8 | ECDSA | Full self-signed with SAN config. Choose curve. |
+| 9 | Ed25519 | Full self-signed with SAN config. Fixed algorithm. |
+| 10 | Local CA + signed | Create a root CA, then sign a server cert with it. Install the CA once on clients — no more browser warnings for any cert signed by it. |
 
 **Utilities:**
 
-| # | Method | Notes |
+| # | Method | What happens |
 |---|---|---|
-| 10 | Key / random generator | generate keys or random byte strings |
+| 11 | Key / random generator | Generate a standalone key or random byte string. No certificate is created. |
 
 ---
 
-### Step 2 — Output format
+## Steps walkthrough
 
-| # | Format | Files produced |
-|---|---|---|
-| 1 | PEM | `<domain>.crt` + `<domain>.key` |
-| 2 | PEM bundle | `<domain>_fullchain.pem` + `<domain>_privkey.pem` |
-| 3 | PKCS#12 | `<domain>.p12` (no password by default) |
+### Let's Encrypt methods (1–5)
 
-> Let's Encrypt always outputs PEM. The format choice for LE methods affects file naming only.
+**Steps: Method → Format → Variables → Output dir → Summary**
 
----
+Variables asked:
+- Domain name (no www)
+- Contact email — used by acme.sh to register an ACME account
+- Webroot path — only for method 2
+- Cloudflare API token — only for method 5
 
-### Step 3 — Certificate details
-
-The wizard asks only for fields relevant to the chosen method:
-
-| Field | Asked for |
-|---|---|
-| Domain or IP | all methods |
-| Contact email | Let's Encrypt only |
-| Country, state, city, org, department | self-signed only |
-| Validity in days | self-signed only |
-| RSA key size | RSA methods |
-| ECDSA curve | ECDSA methods |
-| Webroot path | LE webroot method |
-| Cloudflare API token | LE Cloudflare wildcard |
-| CA key passphrase (yes / no) | Local CA method only |
+Output format choice (step 2) affects file naming only — acme.sh always writes PEM internally.
 
 ---
 
-### Step 4 — Output directory
+### Simple self-signed (method 6)
 
-Choose where certificate files are saved:
+**Steps: Method → Variables → Output dir → Summary**
 
-- **Same directory as the script** — files appear next to `ssl-wizard.sh`
-- **Custom path** — enter any absolute path; the directory is created if it does not exist
+No format selection, no openssl.cnf generated.
 
----
+Variables asked:
+- RSA key size: `2048` / `3072` / `4096`
+- Domain or IP address
+- Validity in days (default: `365`)
 
-### Step 5 — Summary
-
-Review all selected parameters before execution.
-Confirm with `y`, go back with `b`, or press Enter / any other key to cancel.
-
----
-
-## Key generator (method 10)
-
-Separate flow — no certificate is created, only a key or random value.
-
-### RSA
-
-Generates a private key using `openssl genpkey`.
-Choose key size: `2048` / `3072` / `4096` bits.
-Output: `key_rsa<bits>.pem`
-The corresponding public key is printed to the terminal after generation.
-
-### ECDSA
-
-Generates a private key using `openssl genpkey`.
-Choose curve: `P-256` (prime256v1) / `P-384` (secp384r1) / `P-521` (secp521r1).
-Output: `key_ecdsa_<curve>.pem`
-The corresponding public key is printed to the terminal after generation.
-
-### Ed25519
-
-Generates a private key using `openssl genpkey -algorithm Ed25519`.
-No parameters to choose — fixed algorithm.
-Output: `key_ed25519.pem`
-The corresponding public key is printed to the terminal after generation.
-
-### Random bytes
-
-Generates a random byte string using `openssl rand`.
-Choose format: `base64` or `hex`.
-Choose length: number of input bytes (e.g. `48` → 64-character base64 string).
-Output: printed to terminal + saved to `rand_<bytes>bytes.<format>`.
-
-Example equivalent commands:
+Runs exactly these three commands:
 ```bash
-openssl rand -base64 48
-openssl rand -hex 32
+openssl genrsa -out privkey.pem <bits>
+openssl req -new -key privkey.pem -out cert.csr -subj "/CN=<domain>"
+openssl x509 -req -days <days> -in cert.csr -signkey privkey.pem -out fullchain.pem
+```
+
+---
+
+### RSA / ECDSA / Ed25519 self-signed (methods 7–9)
+
+**Steps: Method → Format → Variables → Output dir → Summary**
+
+Variables asked:
+- Domain or IP address
+- Country code (2 letters)
+- State / Region
+- City
+- Organisation name
+- Department / Unit
+- Validity in days (default: `398`)
+- RSA key size — method 7 only: `2048` / `3072` / `4096`
+- ECDSA curve — method 8 only: `P-256` / `P-384` / `P-521`
+
+Generates `openssl.cnf` with Subject Alternative Names automatically.
+For IP addresses the SAN is written as `IP.1` — no manual editing needed.
+
+---
+
+### Local CA + signed cert (method 10)
+
+**Steps: Method → Format → Variables → Output dir → Summary**
+
+Same variables as RSA/ECDSA/Ed25519 plus:
+- CA key passphrase: with or without
+
+Three internal steps:
+1. Generate root CA key and self-signed CA certificate (valid 10 years)
+2. Generate server key and CSR
+3. Sign server CSR with the CA
+
+After completion the wizard prints instructions for installing `ca.crt` into trust stores on Linux, Windows, and macOS.
+
+---
+
+### Key / random generator (method 11)
+
+**Steps: Method → Algorithm → Output dir → Summary**
+
+No certificate is created. Choose an algorithm:
+
+| Algorithm | Parameters | Output file |
+|---|---|---|
+| RSA | key size: 2048 / 3072 / 4096 | `key_rsa<bits>.pem` |
+| ECDSA | curve: P-256 / P-384 / P-521 | `key_ecdsa_<curve>.pem` |
+| Ed25519 | none | `key_ed25519.pem` |
+| Random bytes | format: base64 / hex; length in bytes | `rand_<n>bytes.<format>` |
+
+For RSA, ECDSA, and Ed25519 the public key is also printed to the terminal after generation.
+For random bytes the string is printed to the terminal and saved to the output file.
+
+Random bytes examples:
+```bash
+openssl rand -base64 48   # 48 bytes → 64-char base64 string
+openssl rand -hex 32      # 32 bytes → 64-char hex string
 ```
 
 ---
 
 ## Output files
 
-### Let's Encrypt
+### Let's Encrypt (methods 1–5)
 
 acme.sh stores certificates in `~/.acme.sh/<domain>/`.
-The wizard copies them to your chosen output directory:
+The wizard copies them to your chosen output directory.
 
 ```
 <outdir>/
-  <domain>_fullchain.pem    ← use as ssl_certificate
-  <domain>_privkey.pem      ← use as ssl_certificate_key
-  <domain>_chain.pem        ← CA chain (for ssl_trusted_certificate)
+  <domain>_fullchain.pem    ← ssl_certificate
+  <domain>_privkey.pem      ← ssl_certificate_key
+  <domain>_chain.pem        ← ssl_trusted_certificate (if available)
   <domain>.p12              ← only if PKCS#12 format selected
 ```
 
-### Self-signed (RSA / ECDSA / Ed25519)
+---
+
+### Simple self-signed (method 6)
 
 ```
 <outdir>/
-  <domain>.crt              ← use as ssl_certificate
-  <domain>.key              ← use as ssl_certificate_key
-  openssl.cnf               ← generated config with SAN
+  privkey.pem               ← ssl_certificate_key
+  cert.csr                  ← intermediate file, can be deleted after
+  fullchain.pem             ← ssl_certificate
+```
+
+---
+
+### RSA / ECDSA / Ed25519 self-signed (methods 7–9)
+
+```
+<outdir>/
+  <domain>.key              ← ssl_certificate_key
+  <domain>.crt              ← ssl_certificate
+  openssl.cnf               ← generated SAN config
   <domain>.p12              ← only if PKCS#12 format selected
 ```
 
-### Local CA
+---
+
+### Local CA (method 10)
 
 ```
 <outdir>/
-  ca.crt                    ← distribute to client trust stores
   ca.key                    ← keep safe, needed to sign future certs
-  <domain>.crt
-  <domain>.key
-  <domain>.csr
-  openssl.cnf
+  ca.crt                    ← distribute to client trust stores
+  <domain>.key              ← ssl_certificate_key
+  <domain>.csr              ← intermediate file, can be deleted after
+  <domain>.crt              ← ssl_certificate
+  openssl.cnf               ← generated SAN config
   <domain>.p12              ← only if PKCS#12 format selected
 ```
 
@@ -205,44 +227,68 @@ The wizard copies them to your chosen output directory:
 
 ## nginx directives
 
-After every successful certificate creation the wizard prints ready-to-use nginx directives:
+After every successful certificate creation the wizard prints ready-to-paste nginx lines:
 
 ```nginx
-ssl_certificate     /path/to/<domain>.crt;
-ssl_certificate_key /path/to/<domain>.key;
+ssl_certificate     /path/to/cert;
+ssl_certificate_key /path/to/key;
 ```
-
-Copy and paste them into your `server {}` block.
 
 ---
 
-## Let's Encrypt — Cloudflare wildcard
+## Output formats
 
-The wizard uses the `dns_cf` plugin built into acme.sh.
-You need a **Cloudflare API token** (not the global API key).
+| # | Format | Files |
+|---|---|---|
+| 1 | PEM | `<domain>.crt` + `<domain>.key` |
+| 2 | PEM bundle | `<domain>_fullchain.pem` + `<domain>_privkey.pem` |
+| 3 | PKCS#12 | `<domain>.p12` — no password by default |
+
+> Not available for method 6 (Simple) and method 11 (Key generator).
+
+---
+
+## Passphrase behaviour
+
+| Method | CA key | Server key |
+|---|---|---|
+| Simple (6) | — | no passphrase |
+| RSA (7) | — | no passphrase |
+| ECDSA (8) | — | no passphrase |
+| Ed25519 (9) | — | no passphrase |
+| Local CA (10) | your choice at step 3 | no passphrase |
+| Key generator (11) | — | no passphrase |
+
+Keys without a passphrase load automatically when nginx starts.
+A CA key with a passphrase must be entered manually each time you sign a new certificate.
+
+---
+
+## Let's Encrypt — Cloudflare wildcard (method 5)
+
+Uses the `dns_cf` plugin built into acme.sh. Requires a Cloudflare **API token** (not the global API key).
 
 How to create a token:
 1. Cloudflare dashboard → My Profile → API Tokens
-2. Create Token → Edit zone DNS (use template)
-3. Set Zone Resources to your domain
+2. Create Token → Edit zone DNS (template)
+3. Zone Resources → your domain
 4. Copy the token and paste it when the wizard asks
 
-The token is passed as the `CF_Token` environment variable — it is not stored anywhere by the wizard.
+The token is passed as the `CF_Token` environment variable and is not stored anywhere.
 
 ---
 
-## Let's Encrypt — manual DNS wildcard
+## Let's Encrypt — manual DNS wildcard (method 4)
 
-When you select method 4, acme.sh outputs a TXT record value and pauses.
-Add the record to your DNS:
+acme.sh outputs a TXT record value and pauses. Add the record to your DNS:
 
 | Field | Value |
 |---|---|
-| Type | TXT |
+| Type | `TXT` |
 | Name | `_acme-challenge.<domain>` |
 | Value | shown by acme.sh |
 
-After the DNS record propagates, complete the issuance by running:
+After the record propagates, complete issuance by running:
 
 ```bash
 ~/.acme.sh/acme.sh --renew \
@@ -252,9 +298,36 @@ After the DNS record propagates, complete the issuance by running:
 
 ---
 
-## Local CA — trust store setup
+## Let's Encrypt — auto-renewal
 
-After using method 9, distribute `ca.crt` to all clients that need to trust your internal certificates.
+acme.sh installs a cron job automatically during setup:
+
+```
+0 0 * * * ~/.acme.sh/acme.sh --cron --home ~/.acme.sh > /dev/null
+```
+
+To reload nginx automatically after each renewal, run once after issuance:
+
+```bash
+~/.acme.sh/acme.sh --install-cert \
+  --domain <domain> \
+  --cert-file      /etc/ssl/custom/<domain>.crt \
+  --key-file       /etc/ssl/custom/<domain>.key \
+  --fullchain-file /etc/ssl/custom/<domain>_fullchain.pem \
+  --reloadcmd      "systemctl reload nginx"
+```
+
+Test renewal without making changes:
+
+```bash
+~/.acme.sh/acme.sh --renew --domain <domain> --force --test
+```
+
+---
+
+## Local CA — install into trust stores
+
+After running method 10, distribute `ca.crt` to all clients:
 
 **Debian / Ubuntu**
 ```bash
@@ -281,53 +354,11 @@ sudo security add-trusted-cert -d -r trustRoot \
 
 ---
 
-## Let's Encrypt — auto-renewal
-
-acme.sh sets up a cron job automatically during installation:
-
-```
-0 0 * * * ~/.acme.sh/acme.sh --cron --home ~/.acme.sh > /dev/null
-```
-
-To reload nginx after renewal, install a deploy hook:
-
-```bash
-~/.acme.sh/acme.sh --install-cert \
-  --domain <domain> \
-  --cert-file      /etc/ssl/custom/<domain>.crt \
-  --key-file       /etc/ssl/custom/<domain>.key \
-  --fullchain-file /etc/ssl/custom/<domain>_fullchain.pem \
-  --reloadcmd      "systemctl reload nginx"
-```
-
-Test that renewal works without making changes:
-
-```bash
-~/.acme.sh/acme.sh --renew --domain <domain> --force --test
-```
-
----
-
-## Passphrase
-
-| Method | Passphrase behaviour |
-|---|---|
-| RSA self-signed | always without passphrase |
-| ECDSA self-signed | always without passphrase |
-| Ed25519 self-signed | always without passphrase |
-| Local CA key | choose at step 3: with or without |
-| Server key in Local CA | always without passphrase |
-| Key generator | always without passphrase |
-
-Keys without a passphrase can be loaded by nginx automatically on startup.
-Keys with a passphrase require manual entry every time the service starts.
-
----
-
 ## Notes
 
 - The script must be run as root (`sudo`).
-- acme.sh is installed to `~/.acme.sh/` of the root user when run with sudo.
-- For IP addresses, self-signed methods only. The IP is placed in the `IP.1` SAN field automatically — no manual editing of `openssl.cnf` needed.
-- PKCS#12 files are exported without a password by default. To add one, edit the `maybe_convert_p12` function in the script and change `-passout pass:` to `-passout pass:yourpassword`.
-- The key generator does not create certificates — use it separately when you only need a key or a random secret.
+- acme.sh is installed to `~/.acme.sh/` of the user running the script (root when using sudo).
+- Let's Encrypt does not issue certificates for bare IP addresses — use self-signed methods for IP-only servers.
+- For IP addresses, the wizard automatically places the IP under `IP.1` in the SAN field instead of `DNS.1`.
+- PKCS#12 files are exported without a password. To add one, edit the `maybe_convert_p12` function and change `-passout pass:` to `-passout pass:yourpassword`.
+- Method 6 (Simple) does not include Subject Alternative Names — modern browsers may show a warning. Use methods 7–9 for anything that needs SAN support.
