@@ -619,14 +619,16 @@ step_method() {
                "Key or password"      "a key or a random string only"
         opt 12 "Сканировать папку"    "найти сертификаты и поставить на автопродление" \
                "Scan a folder"        "find certificates and put them on auto-renewal"
-        opt 13 "Настройки"            "автоисправление порта 80, уведомления" \
+        opt 13 "Автопродление"        "список, проверить и продлить сейчас" \
+               "Auto-renewal"         "the list, check and renew now"
+        opt 14 "Настройки"            "автоисправление порта 80, уведомления" \
                "Settings"             "port 80 auto-fix, notifications"
-        opt 14 "Язык / Language"      "English" \
+        opt 15 "Язык / Language"      "English" \
                "Язык / Language"      "Русский"
         blank; hr; blank
 
         local c=""
-        pick c 14 exit
+        pick c 15 exit
         [[ "$NAV" == "back" ]] && return 0
 
         if [[ "$c" == "12" ]]; then
@@ -634,10 +636,14 @@ step_method() {
             continue
         fi
         if [[ "$c" == "13" ]]; then
-            step_settings
+            step_renewals
             continue
         fi
         if [[ "$c" == "14" ]]; then
+            step_settings
+            continue
+        fi
+        if [[ "$c" == "15" ]]; then
             choose_lang
             continue
         fi
@@ -2365,6 +2371,7 @@ UNIT
 RENEW_ECHO=""           # also print log lines (renewing from the menu)
 RENEW_RENEWED=0
 RENEW_FAILED=0
+RENEW_FORCE=""          # renew even if not due yet ("renew now" from the menu)
 
 renew_log() {
     printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$RENEW_LOG"
@@ -2454,7 +2461,7 @@ acme_renew_entry() {
 renew_entry() {
     local result="$1" first="${E_OUTPUTS[0]#*:}" left tmp new chain="" args=()
     left="$(days_left "$first")" || die "не удаётся прочитать сертификат: ${first}" "cannot read the certificate: ${first}"
-    if (( left > $(renew_threshold "$E_DAYS") )); then
+    if [[ -z "$RENEW_FORCE" ]] && (( left > $(renew_threshold "$E_DAYS") )); then
         printf 'skipped\n%s\n' "$left" > "$result"
         return 0
     fi
@@ -2559,6 +2566,192 @@ run_renew_mode() {
     fi
     run_renew "${confs[@]}"
     (( RENEW_FAILED == 0 ))
+}
+
+# ==============================================================================
+# Auto-renewal menu — the list of certificates on auto-renewal, "check all now"
+# (what the daily run does), "renew one now" and "remove from auto-renewal"
+# ==============================================================================
+A_N=0
+A_CONF=(); A_NAME=(); A_KIND=(); A_FIRST=(); A_MORE=(); A_LEFT=(); A_END=(); A_FROM=()
+A_ORDER=()              # list positions, soonest expiry first
+
+# load_renew_list — fills A_* from RENEW_DIR
+load_renew_list() {
+    local f k end info=() confs=()
+    A_N=0
+    A_CONF=(); A_NAME=(); A_KIND=(); A_FIRST=(); A_MORE=(); A_LEFT=(); A_END=(); A_FROM=(); A_ORDER=()
+    mapfile -t confs < <(find "$RENEW_DIR" -maxdepth 1 -name '*.conf' -type f 2>/dev/null | sort)
+    for f in ${confs[@]+"${confs[@]}"}; do
+        mapfile -t info < <( reset_entry; source "$f"
+                             printf '%s\n' "$E_NAME" "$E_TYPE" "$E_ACME_MODE" "$E_DAYS" "${E_OUTPUTS[0]#*:}" \
+                                           "$(( ${#E_OUTPUTS[@]} + ${#E_P12[@]} - 1 ))" )
+        k=$A_N
+        A_N=$((A_N + 1))
+        A_CONF[k]="$f"
+        A_NAME[k]="${info[0]:-?}"
+        case "${info[1]:-}" in
+            acme) case "${info[2]:-}" in
+                      existing) MSG="Let's Encrypt (acme.sh)" ;;
+                      "")       MSG="Let's Encrypt" ;;
+                      *)        MSG="Let's Encrypt (${info[2]})" ;;
+                  esac ;;
+            self) tl "самоподписанный" "self-signed" ;;
+            ca)   tl "подписан своим CA" "signed by your own CA" ;;
+            *)    MSG="${info[1]:-?}" ;;
+        esac
+        A_KIND[k]="$MSG"
+        A_FIRST[k]="${info[4]:-}"
+        A_MORE[k]="${info[5]:-0}"
+        A_LEFT[k]=""; A_END[k]=""; A_FROM[k]=""
+        if end="$(cert_epoch "${A_FIRST[k]}" end 2>/dev/null)" && [[ -n "$end" ]]; then
+            A_LEFT[k]="$(days_left "${A_FIRST[k]}")"
+            A_END[k]="$(date -d "@${end}" +%Y-%m-%d)"
+            A_FROM[k]="$(date -d "@$(( end - $(renew_threshold "${info[3]:-90}") * 86400 ))" +%Y-%m-%d)"
+        fi
+    done
+    mapfile -t A_ORDER < <(for ((k = 0; k < A_N; k++)); do echo "${A_LEFT[k]:-99999} $k"; done | sort -n | cut -d' ' -f2)
+    return 0
+}
+
+# Where the daily check runs, if anywhere
+renew_schedule_status() {
+    if [[ -f "$CRON_FILE" ]]; then
+        tl "ежедневно в 03:30 (cron: ${CRON_FILE})" "every day at 03:30 (cron: ${CRON_FILE})"
+    elif command -v systemctl &>/dev/null && systemctl is-enabled ssl-wizard-renew.timer &>/dev/null; then
+        tl "ежедневно в 03:30 (systemd: ssl-wizard-renew.timer)" "every day at 03:30 (systemd: ssl-wizard-renew.timer)"
+    else
+        tl "не настроена" "not set up"
+    fi
+    echo "$MSG"
+}
+
+show_renew_list() {
+    local i=0 k color when more
+    for k in ${A_ORDER[@]+"${A_ORDER[@]}"}; do
+        i=$((i + 1))
+        if [[ -z "${A_LEFT[k]}" ]]; then
+            tl "файл сертификата не найден" "certificate file not found"
+            color="$RED"
+        elif (( A_LEFT[k] < 0 )); then
+            tl "истёк ${A_END[k]} — будет продлён при следующей проверке" "expired on ${A_END[k]} — will be renewed at the next check"
+            color="$RED"
+        else
+            tl "действует до ${A_END[k]}, осталось ${A_LEFT[k]} дн. — продление с ${A_FROM[k]}" \
+               "valid until ${A_END[k]}, days left: ${A_LEFT[k]} — renewal from ${A_FROM[k]}"
+            if (( A_LEFT[k] <= 30 )); then color="$YELLOW"; else color="$GREEN"; fi
+        fi
+        when="$MSG"
+        more=""
+        if (( A_MORE[k] > 0 )); then
+            tl " (и ещё файлов: ${A_MORE[k]})" " (more files: ${A_MORE[k]})"
+            more="$MSG"
+        fi
+        printf "  ${BLUE}%3s)${R}  %s ${DIM}%s${R}\n" "$i" "$(pad "${A_NAME[k]}" 30)" "${A_KIND[k]}"
+        echo -e "        ${color}${when}${R}"
+        echo -e "        ${DIM}${A_FIRST[k]}${more}${R}"
+        blank
+    done
+}
+
+# pick_from_list VARNAME — asks for a certificate number; VARNAME gets its A_* index
+pick_from_list() {
+    local -n __pfl_ref=$1
+    local n=""
+    hint "Номер сертификата из списка выше." "The certificate number from the list above."
+    pick n "$A_N"
+    [[ "$NAV" == "back" ]] && return 0
+    __pfl_ref="${A_ORDER[$((n - 1))]}"
+}
+
+# Prints the result of a run_renew from the menu
+renew_summary() {
+    blank
+    if (( RENEW_FAILED > 0 )); then
+        err "Ошибок: ${RENEW_FAILED}. Подробности — выше и в ${RENEW_LOG}" \
+            "Errors: ${RENEW_FAILED}. Details above and in ${RENEW_LOG}"
+    elif (( RENEW_RENEWED > 0 )); then
+        ok "Продлено: ${RENEW_RENEWED}" "Renewed: ${RENEW_RENEWED}"
+    else
+        ok "Продлевать пока нечего — у всех сертификатов срок ещё не подошёл." \
+           "Nothing to renew yet — no certificate is due."
+    fi
+    blank
+    pause
+}
+
+# Menu item "Auto-renewal"
+step_renewals() {
+    local saved_step=$STEP_I c k sure
+    STEP_I=0
+    while true; do
+        screen "Автопродление" "Auto-renewal"
+        load_renew_list
+        if (( A_N == 0 )); then
+            hint "Пока ни один сертификат не стоит на автопродлении." "No certificate is on auto-renewal yet."
+            hint "Они появятся здесь после выпуска через Let's Encrypt или после «Сканировать папку»." \
+                 "They appear here after a Let's Encrypt issue or after \"Scan a folder\"."
+            blank
+            pause "Нажмите Enter, чтобы вернуться…" "Press Enter to go back…"
+            break
+        fi
+        show_renew_list
+        row "Проверка" "Check" "$(renew_schedule_status)"
+        row "Журнал" "Log" "$RENEW_LOG"
+        blank; hr; blank
+        opt 1 "Проверить все сейчас"     "продлить те, у кого подошёл срок — как ежедневная проверка" \
+              "Check all now"            "renew the ones that are due — like the daily check"
+        opt 2 "Продлить сертификат"      "выбранный, сразу, независимо от срока" \
+              "Renew a certificate"      "the one you choose, right now, whatever its expiry"
+        opt 3 "Убрать из автопродления"  "файлы сертификата не трогаются" \
+              "Remove from auto-renewal" "the certificate files are left as they are"
+        blank
+        c=""
+        pick c 3
+        [[ "$NAV" == "back" ]] && break
+
+        case "$c" in
+            1)
+                blank
+                RENEW_ECHO="yes"
+                run_renew "${A_CONF[@]}"
+                RENEW_ECHO=""
+                renew_summary ;;
+            2)
+                blank
+                k=""
+                pick_from_list k
+                if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
+                blank
+                info "Продлеваю ${A_NAME[k]}…" "Renewing ${A_NAME[k]}…"
+                RENEW_ECHO="yes"
+                RENEW_FORCE="yes"
+                run_renew "${A_CONF[k]}"
+                RENEW_FORCE=""
+                RENEW_ECHO=""
+                renew_summary ;;
+            3)
+                blank
+                k=""
+                pick_from_list k
+                if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
+                blank
+                warn "Убрать «${A_NAME[k]}» из автопродления? Файлы останутся на месте." \
+                     "Remove \"${A_NAME[k]}\" from auto-renewal? The files stay where they are."
+                opt 1 "Да, убрать" "" "Yes, remove" ""
+                blank
+                sure=""
+                pick sure 1
+                if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
+                rm -f -- "${A_CONF[k]}"
+                ok "Убрано из автопродления: ${A_NAME[k]}" "Removed from auto-renewal: ${A_NAME[k]}"
+                blank
+                pause ;;
+        esac
+        NAV=""
+    done
+    STEP_I=$saved_step
+    NAV=""
 }
 
 # ==============================================================================

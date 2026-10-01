@@ -641,12 +641,14 @@ function Step-Method {
                (L 'только ключ или случайная строка' 'a key or a random string only')
         Opt 11 (L 'Сканировать папку' 'Scan a folder') `
                (L 'найти сертификаты и поставить на автопродление' 'find certificates and put them on auto-renewal')
-        Opt 12 (L 'Настройки' 'Settings') `
+        Opt 12 (L 'Автопродление' 'Auto-renewal') `
+               (L 'список, проверить и продлить сейчас' 'the list, check and renew now')
+        Opt 13 (L 'Настройки' 'Settings') `
                (L 'автоисправление порта 80, уведомления' 'port 80 auto-fix, notifications')
-        Opt 13 'Язык / Language' (L 'English' 'Русский')
+        Opt 14 'Язык / Language' (L 'English' 'Русский')
         Blank; Hr; Blank
 
-        $c = Read-Pick 13 -Exit
+        $c = Read-Pick 14 -Exit
         if ($script:Nav -eq 'back') { return }
 
         if ($c -eq 11) {
@@ -654,10 +656,14 @@ function Step-Method {
             continue
         }
         if ($c -eq 12) {
-            Step-Settings
+            Step-Renewals
             continue
         }
         if ($c -eq 13) {
+            Step-Settings
+            continue
+        }
+        if ($c -eq 14) {
             Choose-Lang
             continue
         }
@@ -1919,7 +1925,8 @@ function Renew-ScannedEntry($Entry) {
 }
 
 # Renews every entry that is due. Counts go to $script:RenewResult
-function Invoke-RenewalCore([object[]]$List) {
+# -Force: renew even if not due yet ("renew now" from the menu)
+function Invoke-RenewalCore([object[]]$List, [switch]$Force) {
     $renewed = 0
     $failed  = 0
     foreach ($item in $List) {
@@ -1934,9 +1941,9 @@ function Invoke-RenewalCore([object[]]$List) {
                 $order = $null
                 try { $order = Get-PAOrder -MainDomain $item.Domain -ErrorAction SilentlyContinue } catch { }
                 if ($order -and @($order.Plugin) -contains 'WebSelfHost') {
-                    $cert = Invoke-WithPort80 { Submit-Renewal -MainDomain $item.Domain -WarningAction SilentlyContinue }
+                    $cert = Invoke-WithPort80 { Submit-Renewal -MainDomain $item.Domain -Force:$Force -WarningAction SilentlyContinue }
                 } else {
-                    $cert = Submit-Renewal -MainDomain $item.Domain -WarningAction SilentlyContinue
+                    $cert = Submit-Renewal -MainDomain $item.Domain -Force:$Force -WarningAction SilentlyContinue
                 }
                 if (-not $cert) {
                     Write-RenewLog ("${name}: " + (L 'продлевать ещё рано' 'not due for renewal yet'))
@@ -1946,7 +1953,7 @@ function Invoke-RenewalCore([object[]]$List) {
                 $where = $item.CertOut
             } else {
                 $left = Get-DaysLeft @($item.Outputs)[0].Path
-                if ($left -gt (Get-RenewThreshold $item.Days)) {
+                if (-not $Force -and $left -gt (Get-RenewThreshold $item.Days)) {
                     Write-RenewLog ("${name}: " + (L "продлевать ещё рано (осталось $left дн.)" "not due for renewal yet ($left days left)"))
                     continue
                 }
@@ -1999,6 +2006,163 @@ function Invoke-Renewal {
     if ($script:OpenSsl) { Set-OpenSslEnv }
     Invoke-RenewalCore $list
     if ($script:RenewResult.Failed -gt 0) { exit 1 }
+}
+
+# ==============================================================================
+# Auto-renewal menu - the list of certificates on auto-renewal, "check all now"
+# (what the daily task does), "renew one now" and "remove from auto-renewal"
+# ==============================================================================
+# One row per renew.json entry, soonest expiry first
+function Get-RenewRows {
+    $list = @(Read-RenewList)
+    $rows = @()
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $item  = $list[$i]
+        $first = if ($item.CertOut) { $item.CertOut } else { @($item.Outputs)[0].Path }
+        $files = if ($item.Type) { @($item.Outputs).Count + @($item.P12 | Where-Object { $_ }).Count } else { 1 + [int][bool]$item.P12 }
+        switch ($item.Type) {
+            ''      { $kind = "Let's Encrypt" }
+            'acme'  { $kind = "Let's Encrypt ($($item.Plugin))" }
+            'self'  { $kind = L 'самоподписанный' 'self-signed' }
+            'ca'    { $kind = L 'подписан своим CA' 'signed by your own CA' }
+            default { $kind = $item.Type }
+        }
+        if (-not $item.Type) { $kind = "Let's Encrypt" }
+        $row = [pscustomobject]@{
+            Index = $i; Item = $item
+            Name  = if ($item.Name) { $item.Name } else { $item.Domain }
+            Kind  = $kind; First = $first; More = $files - 1
+            Left  = $null; End = $null; From = $null
+        }
+        try {
+            $x = New-X509 @(Get-PemCertBlocks ([IO.File]::ReadAllText($first)))[0]
+            $validity = [int][Math]::Round(($x.NotAfter - $x.NotBefore).TotalDays)
+            $row.Left = [int][Math]::Floor(($x.NotAfter - (Get-Date)).TotalDays)
+            $row.End  = $x.NotAfter
+            $row.From = $x.NotAfter.AddDays(-(Get-RenewThreshold $validity))
+        } catch { }
+        $rows += $row
+    }
+    return @($rows | Sort-Object @{ Expression = { if ($null -eq $_.Left) { [int]::MaxValue } else { $_.Left } } })
+}
+
+function Show-RenewRows([object[]]$Rows) {
+    $n = 0
+    foreach ($r in $Rows) {
+        $n++
+        if ($null -eq $r.Left) {
+            $when = L 'файл сертификата не найден' 'certificate file not found'; $color = 'Red'
+        } elseif ($r.Left -lt 0) {
+            $when = L "истёк $($r.End.ToString('yyyy-MM-dd')) - будет продлён при следующей проверке" `
+                      "expired on $($r.End.ToString('yyyy-MM-dd')) - will be renewed at the next check"
+            $color = 'Red'
+        } else {
+            $when = L "действует до $($r.End.ToString('yyyy-MM-dd')), осталось $($r.Left) дн. - продление с $($r.From.ToString('yyyy-MM-dd'))" `
+                      "valid until $($r.End.ToString('yyyy-MM-dd')), days left: $($r.Left) - renewal from $($r.From.ToString('yyyy-MM-dd'))"
+            $color = if ($r.Left -le 30) { 'Yellow' } else { 'Green' }
+        }
+        $more = if ($r.More -gt 0) { L " (и ещё файлов: $($r.More))" " (more files: $($r.More))" } else { '' }
+        Write-Host ('  {0,3})  ' -f $n) -ForegroundColor Blue -NoNewline
+        Write-Host (([string]$r.Name).PadRight(30) + ' ') -NoNewline
+        Write-Host $r.Kind -ForegroundColor DarkGray
+        Write-Host "        $when" -ForegroundColor $color
+        Write-Host "        $($r.First)$more" -ForegroundColor DarkGray
+        Blank
+    }
+}
+
+function Get-RenewTaskStatus {
+    $task = Get-ScheduledTask -TaskName $script:RenewTask -ErrorAction SilentlyContinue
+    if ($task) { return L "ежедневно в 03:30 (задача $($script:RenewTask))" "every day at 03:30 (task $($script:RenewTask))" }
+    return L 'не настроена' 'not set up'
+}
+
+# Result of a renewal started from the menu
+function Show-RenewSummary {
+    Blank
+    $r = $script:RenewResult
+    if ($r.Failed -gt 0) {
+        Err (L "Ошибок: $($r.Failed). Подробности - выше и в $($script:RenewLog)" "Errors: $($r.Failed). Details above and in $($script:RenewLog)")
+    } elseif ($r.Renewed -gt 0) {
+        Ok (L "Продлено: $($r.Renewed)" "Renewed: $($r.Renewed)")
+    } else {
+        Ok (L 'Продлевать пока нечего - у всех сертификатов срок ещё не подошёл.' 'Nothing to renew yet - no certificate is due.')
+    }
+    Blank
+    Pause-Wizard
+}
+
+# Menu item "Auto-renewal"
+function Step-Renewals {
+    $savedStep = $script:StepI
+    $script:StepI = 0
+    try {
+        while ($true) {
+            Screen (L 'Автопродление' 'Auto-renewal')
+            $rows = @(Get-RenewRows)
+            if ($rows.Count -eq 0) {
+                Hint (L 'Пока ни один сертификат не стоит на автопродлении.' 'No certificate is on auto-renewal yet.')
+                Hint (L "Они появятся здесь после выпуска через Let's Encrypt или после 'Сканировать папку'." `
+                        "They appear here after a Let's Encrypt issue or after 'Scan a folder'.")
+                Blank
+                Pause-Wizard (L 'Нажмите Enter, чтобы вернуться...' 'Press Enter to go back...')
+                return
+            }
+            Show-RenewRows $rows
+            Row (L 'Проверка' 'Check') (Get-RenewTaskStatus)
+            Row (L 'Журнал' 'Log') $script:RenewLog
+            Blank; Hr; Blank
+            Opt 1 (L 'Проверить все сейчас' 'Check all now') `
+                  (L 'продлить те, у кого подошёл срок - как ежедневная проверка' 'renew the ones that are due - like the daily check')
+            Opt 2 (L 'Продлить сертификат' 'Renew a certificate') `
+                  (L 'выбранный, сразу, независимо от срока' 'the one you choose, right now, whatever its expiry')
+            Opt 3 (L 'Убрать из автопродления' 'Remove from auto-renewal') `
+                  (L 'файлы сертификата не трогаются' 'the certificate files are left as they are')
+            Blank
+            $c = Read-Pick 3
+            if ($script:Nav -eq 'back') { return }
+
+            if ($c -eq 1) {
+                Blank
+                $script:RenewEcho = $true
+                try { Invoke-RenewalCore @($rows | ForEach-Object { $_.Item }) } finally { $script:RenewEcho = $false }
+                Show-RenewSummary
+                continue
+            }
+
+            Blank
+            Hint (L 'Номер сертификата из списка выше.' 'The certificate number from the list above.')
+            $k = Read-Pick $rows.Count
+            if ($script:Nav -eq 'back') { $script:Nav = ''; continue }
+            $row = $rows[$k - 1]
+
+            if ($c -eq 2) {
+                Blank
+                Info (L "Продлеваю $($row.Name)..." "Renewing $($row.Name)...")
+                $script:RenewEcho = $true
+                try { Invoke-RenewalCore @($row.Item) -Force } finally { $script:RenewEcho = $false }
+                Show-RenewSummary
+                continue
+            }
+
+            Blank
+            Warn (L "Убрать '$($row.Name)' из автопродления? Файлы останутся на месте." `
+                    "Remove '$($row.Name)' from auto-renewal? The files stay where they are.")
+            Opt 1 (L 'Да, убрать' 'Yes, remove')
+            Blank
+            [void](Read-Pick 1)
+            if ($script:Nav -eq 'back') { $script:Nav = ''; continue }
+            $list = @(Read-RenewList)
+            $keep = @(for ($i = 0; $i -lt $list.Count; $i++) { if ($i -ne $row.Index) { $list[$i] } })
+            Write-Text $script:RenewList (ConvertTo-Json -InputObject $keep -Depth 6)
+            Ok (L "Убрано из автопродления: $($row.Name)" "Removed from auto-renewal: $($row.Name)")
+            Blank
+            Pause-Wizard
+        }
+    } finally {
+        $script:StepI = $savedStep
+        $script:Nav = ''
+    }
 }
 
 # ==============================================================================

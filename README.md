@@ -139,6 +139,7 @@ No domain required; an IP address works too. Browsers will show a warning.
 |---|---|
 | Key or password | Creates only a key (RSA, ECDSA, Ed25519) or a random string (base64 / hex). No certificate is created. |
 | Scan a folder | Finds existing certificates (in subfolders too, if you want), shows when they expire and puts them on auto-renewal. See [Scanning a folder](#scanning-a-folder). |
+| Auto-renewal | The certificates on auto-renewal; check them all or renew one right now. See [The auto-renewal list](#the-auto-renewal-list). |
 | Settings | Port 80 auto-fix and notifications. See [Settings](#settings). |
 | Язык / Language | Switches the interface language. |
 
@@ -242,6 +243,24 @@ Turn auto-renewal off:
 ```powershell
 Unregister-ScheduledTask -TaskName ssl-wizard-renew -Confirm:$false
 ```
+
+### The auto-renewal list
+
+**Auto-renewal** in the main menu lists every certificate the daily check takes care of — issued by the wizard or added by a folder scan. Soonest expiry comes first. For each certificate you see:
+
+- name and kind (Let's Encrypt and how the domain is checked, self-signed, signed by your own CA);
+- expiry date, days left, and the date from which it will be renewed;
+- the file it lives in, and how many more files are updated with it.
+
+Below the list: whether the daily check is set up, and where the renewal log is.
+
+| Action | What it does |
+|---|---|
+| Check all now | exactly what the daily check does: renews the certificates that are due and skips the rest |
+| Renew a certificate | renews the certificate you choose right away, whatever its expiry date — same files, same kind, with a backup of the old files |
+| Remove from auto-renewal | the certificate is no longer renewed; its files stay where they are. A folder scan can add it back |
+
+Everything a manual run does is shown on screen and written to the renewal log, just like the daily check — including the [port 80 auto-fix](#port-80-auto-fix). Notifications are not sent for manual runs: you see the result yourself.
 
 ---
 
