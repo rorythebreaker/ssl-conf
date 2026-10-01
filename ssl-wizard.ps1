@@ -181,13 +181,35 @@ function Read-Pick([int]$Max, [switch]$Exit) {
 # Read-Answer KEY 'prompt' ['default'] [check]
 # Enter - take the value in brackets; 0 - back (Nav = back).
 # Check - a block returning the error text or $null.
+# Reads a line without echoing it (passwords, tokens). Redirected input - plain read
+function Read-Secret {
+    if ([Console]::IsInputRedirected) { return Read-Line }
+    $chars = New-Object Text.StringBuilder
+    while ($true) {
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq 'Enter') { break }
+        if ($k.Key -eq 'Backspace') {
+            if ($chars.Length -gt 0) { [void]$chars.Remove($chars.Length - 1, 1) }
+            continue
+        }
+        [void]$chars.Append($k.KeyChar)
+    }
+    Write-Host ''
+    return $chars.ToString().Trim()
+}
+
+# With $script:AskSecret the input is not echoed and the default is shown as ***
+$script:AskSecret = $false
 function Read-Answer([string]$Key, [string]$Prompt, [string]$Default = '', [scriptblock]$Check = $null) {
     if ($script:S[$Key]) { $Default = $script:S[$Key] }
     while ($true) {
         Write-Host "  $Prompt" -NoNewline
-        if ($Default) { Write-Host " [$Default]" -ForegroundColor DarkGray -NoNewline }
+        if ($Default) {
+            $shown = if ($script:AskSecret) { '***' } else { $Default }
+            Write-Host " [$shown]" -ForegroundColor DarkGray -NoNewline
+        }
         Write-Host ': ' -NoNewline
-        $in = Read-Line
+        $in = if ($script:AskSecret) { Read-Secret } else { Read-Line }
         if ($in -eq '0') {
             $script:Nav = 'back'
             return
@@ -619,10 +641,12 @@ function Step-Method {
                (L 'только ключ или случайная строка' 'a key or a random string only')
         Opt 11 (L 'Сканировать папку' 'Scan a folder') `
                (L 'найти сертификаты и поставить на автопродление' 'find certificates and put them on auto-renewal')
-        Opt 12 'Язык / Language' (L 'English' 'Русский')
+        Opt 12 (L 'Настройки' 'Settings') `
+               (L 'автоисправление порта 80, уведомления' 'port 80 auto-fix, notifications')
+        Opt 13 'Язык / Language' (L 'English' 'Русский')
         Blank; Hr; Blank
 
-        $c = Read-Pick 12 -Exit
+        $c = Read-Pick 13 -Exit
         if ($script:Nav -eq 'back') { return }
 
         if ($c -eq 11) {
@@ -630,6 +654,10 @@ function Step-Method {
             continue
         }
         if ($c -eq 12) {
+            Step-Settings
+            continue
+        }
+        if ($c -eq 13) {
             Choose-Lang
             continue
         }
@@ -1144,7 +1172,11 @@ function Invoke-LetsEncrypt([string]$Plugin, [hashtable]$PluginArgs, [string[]]$
     }
     if ($PluginArgs.Count -gt 0) { $params.PluginArgs = $PluginArgs }
 
-    $cert = New-PACertificate @params
+    if ($Plugin -eq 'WebSelfHost') {
+        $cert = Invoke-WithPort80 { New-PACertificate @params }
+    } else {
+        $cert = New-PACertificate @params
+    }
     # the certificate exists and is still fresh - New-PACertificate returns nothing
     if (-not $cert) { $cert = Get-PACertificate -MainDomain $Domains[0] }
     if (-not $cert) {
@@ -1268,6 +1300,490 @@ function Write-RenewLog([string]$Text) {
     if ($script:RenewEcho) { Info $Text }
 }
 
+# ==============================================================================
+# Settings - <HomeDir>\settings.json. Tokens and passwords are encrypted for the
+# current Windows user (DPAPI): the renewal task runs as that user and can read them
+# ==============================================================================
+$script:SettingsFile = Join-Path $script:HomeDir 'settings.json'
+$script:Cfg = @{
+    FixStop      = $false   # may stop the service holding port 80 during a Standalone check
+    FixFirewall  = $false   # may open port 80 in Windows Firewall during a Standalone check
+    TgToken      = ''; TgChat = ''
+    MailHost     = ''; MailPort = ''; MailSecurity = ''     # starttls | none
+    MailUser     = ''; MailPass = ''; MailFrom = ''; MailTo = ''
+    WebhookUrl   = ''
+}
+$script:CfgSecret = @('TgToken', 'MailPass', 'WebhookUrl')
+
+function Protect-Text([string]$Text) {
+    if (-not $Text) { return '' }
+    return ConvertFrom-SecureString (ConvertTo-SecureString $Text -AsPlainText -Force)
+}
+
+function Unprotect-Text([string]$Enc) {
+    if (-not $Enc) { return '' }
+    $secure = ConvertTo-SecureString $Enc
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+}
+
+function Load-Settings {
+    if (-not (Test-Path -LiteralPath $script:SettingsFile)) { return }
+    try {
+        $saved = [IO.File]::ReadAllText($script:SettingsFile) | ConvertFrom-Json
+        foreach ($key in @($script:Cfg.Keys)) {
+            if ($script:CfgSecret -contains $key) {
+                $enc = $saved."${key}Enc"
+                if ($enc) { $script:Cfg[$key] = Unprotect-Text $enc }
+            } elseif ($null -ne $saved.$key) {
+                $script:Cfg[$key] = $saved.$key
+            }
+        }
+    } catch {
+        Warn (L "Не удалось прочитать настройки: $($_.Exception.Message)" "Could not read the settings: $($_.Exception.Message)")
+    }
+}
+
+function Save-Settings {
+    $out = [ordered]@{}
+    foreach ($key in @($script:Cfg.Keys | Sort-Object)) {
+        if ($script:CfgSecret -contains $key) { $out["${key}Enc"] = Protect-Text $script:Cfg[$key] }
+        else                                  { $out[$key] = $script:Cfg[$key] }
+    }
+    New-Item -ItemType Directory -Force -Path $script:HomeDir | Out-Null
+    Write-Text $script:SettingsFile (ConvertTo-Json -InputObject $out)
+}
+
+# ==============================================================================
+# Notifications - Telegram, e-mail, webhook; sent when an automatic renewal fails
+# ==============================================================================
+function Test-NotifyConfigured {
+    $c = $script:Cfg
+    return [bool](($c.TgToken -and $c.TgChat) -or ($c.MailHost -and $c.MailTo) -or $c.WebhookUrl)
+}
+
+# JSON as UTF-8 bytes: Invoke-RestMethod in PowerShell 5.1 would otherwise mangle non-ASCII text
+function Send-Json([string]$Url, $Object) {
+    $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Object -Compress))
+    [void](Invoke-RestMethod -Uri $Url -Method Post -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 20 -UseBasicParsing)
+}
+
+function Send-Telegram([string]$Text) {
+    Send-Json "https://api.telegram.org/bot$($script:Cfg.TgToken)/sendMessage" @{ chat_id = $script:Cfg.TgChat; text = $Text }
+}
+
+# .NET SmtpClient: STARTTLS (EnableSsl) or no encryption; it cannot do SSL on port 465
+function Send-Mail([string]$Subject, [string]$Body) {
+    $c = $script:Cfg
+    $msg = New-Object Net.Mail.MailMessage
+    $msg.From = $c.MailFrom
+    foreach ($to in ($c.MailTo -split ',')) { if ($to.Trim()) { $msg.To.Add($to.Trim()) } }
+    $msg.Subject = $Subject
+    $msg.SubjectEncoding = [Text.Encoding]::UTF8
+    $msg.Body = $Body
+    $msg.BodyEncoding = [Text.Encoding]::UTF8
+    $port = if ($c.MailPort) { [int]$c.MailPort } elseif ($c.MailSecurity -eq 'starttls') { 587 } else { 25 }
+    $smtp = New-Object Net.Mail.SmtpClient($c.MailHost, $port)
+    $smtp.EnableSsl = $c.MailSecurity -eq 'starttls'
+    $smtp.Timeout = 30000
+    if ($c.MailUser) { $smtp.Credentials = New-Object Net.NetworkCredential($c.MailUser, $c.MailPass) }
+    try { $smtp.Send($msg) } finally { $msg.Dispose(); $smtp.Dispose() }
+}
+
+# Webhook: "text" suits Slack/Mattermost, "content" Discord
+function Send-Webhook([string]$Subject, [string]$Text) {
+    Send-Json $script:Cfg.WebhookUrl ([ordered]@{
+        event = 'renewal_failed'; host = $env:COMPUTERNAME; subject = $Subject
+        text = "$Subject`n`n$Text"; content = "$Subject`n`n$Text"
+    })
+}
+
+# Send-Notification SUBJECT TEXT - every configured channel; returns "channel: ok/error" lines
+function Send-Notification([string]$Subject, [string]$Text) {
+    $c = $script:Cfg
+    $result = @()
+    $channels = @()
+    if ($c.TgToken -and $c.TgChat)  { $channels += @{ Name = 'Telegram'; Do = { Send-Telegram "$Subject`n`n$Text" } } }
+    if ($c.MailHost -and $c.MailTo) { $channels += @{ Name = 'E-mail';   Do = { Send-Mail $Subject $Text } } }
+    if ($c.WebhookUrl)              { $channels += @{ Name = 'Webhook';  Do = { Send-Webhook $Subject $Text } } }
+    foreach ($ch in $channels) {
+        try {
+            & $ch.Do
+            $result += "$($ch.Name): ok"
+        } catch {
+            $result += "$($ch.Name): " + (L 'ошибка' 'error') + " $($_.Exception.Message)"
+        }
+    }
+    return $result
+}
+
+# The message about a renewal that did not work; results go to the renewal log
+function Send-RenewFailed($Item, [string]$Name, [string]$Notes) {
+    if (-not (Test-NotifyConfigured)) { return }
+    $first = if ($Item.CertOut) { $Item.CertOut } else { @($Item.Outputs)[0].Path }
+    $left = '?'
+    try { $left = Get-DaysLeft $first } catch { }
+    $subject = L "ssl-wizard: не удалось продлить сертификат $Name" "ssl-wizard: could not renew the certificate $Name"
+    $text = L ("Сервер: $env:COMPUTERNAME`nСертификат: $Name`nФайл: $first`nОсталось дней: $left`n`nЧто произошло:`n$Notes`n`n" +
+               "Следующая попытка - завтра. Журнал: $($script:RenewLog)") `
+              ("Server: $env:COMPUTERNAME`nCertificate: $Name`nFile: $first`nDays left: $left`n`nWhat happened:`n$Notes`n`n" +
+               "The next attempt is tomorrow. Log: $($script:RenewLog)")
+    foreach ($line in @(Send-Notification $subject $text)) {
+        Write-RenewLog ("${Name}: " + (L 'уведомление' 'notification') + " - $line")
+    }
+}
+
+# ==============================================================================
+# Port 80 auto-fix - when a Let's Encrypt check through port 80 (Standalone)
+# fails: find out whether a process holds the port and whether Windows Firewall
+# closes it, fix what the settings allow, retry once, then put everything back
+# ==============================================================================
+$script:P80Notes = @()      # findings and actions - for the log and notifications
+
+function Add-P80Note([string]$Text) {
+    $script:P80Notes += $Text
+    Warn $Text
+}
+
+# Who listens on port 80: services that can be stopped and started, and the rest
+function Get-Port80Holders {
+    $holders = @{ Busy = $false; Services = @(); Others = @() }
+    $pids = @(Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.OwningProcess } | Select-Object -Unique)
+    foreach ($procId in $pids) {
+        $holders.Busy = $true
+        if ($procId -eq 4) {
+            # PID 4 is http.sys, shared by IIS and others; IIS is the one we know how to stop
+            $w3 = Get-Service -Name W3SVC -ErrorAction SilentlyContinue
+            if ($w3 -and $w3.Status -eq 'Running') {
+                if ($holders.Services -notcontains 'W3SVC') { $holders.Services += 'W3SVC' }
+            } else {
+                $holders.Others += 'System (http.sys)'
+            }
+            continue
+        }
+        $svc = @(Get-CimInstance Win32_Service -Filter "ProcessId = $procId" -ErrorAction SilentlyContinue)
+        if ($svc.Count -gt 0) {
+            foreach ($s in $svc) { if ($holders.Services -notcontains $s.Name) { $holders.Services += $s.Name } }
+        } else {
+            $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+            $holders.Others += "$(if ($p) { $p.ProcessName } else { '?' }) (pid $procId)"
+        }
+    }
+    return $holders
+}
+
+# Is TCP 80 closed by Windows Firewall: 'closed', 'open', or 'unknown' (cannot read rules)
+function Get-FirewallState {
+    try {
+        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { $_.Enabled -eq 'True' })
+        if ($profiles.Count -eq 0) { return 'open' }
+        if (@($profiles | Where-Object { $_.DefaultInboundAction -ne 'Allow' }).Count -eq 0) { return 'open' }
+        $filters = @(Get-NetFirewallPortFilter -Protocol TCP -ErrorAction Stop | Where-Object {
+            foreach ($p in @($_.LocalPort)) {
+                if ($p -eq '80') { return $true }
+                if ($p -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 80 -and [int]$Matches[2] -ge 80) { return $true }
+            }
+            return $false
+        })
+        $allow = @($filters | Get-NetFirewallRule -ErrorAction Stop | Where-Object {
+            $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' })
+        if ($allow.Count -gt 0) { return 'open' }
+        return 'closed'
+    } catch {
+        return 'unknown'
+    }
+}
+
+$script:P80RuleName = 'ssl-wizard-acme-port80'
+
+# Invoke-WithPort80 {ACTION} - runs a Let's Encrypt action that checks the domain
+# through port 80. If it fails: diagnose, fix what the settings allow, retry once,
+# then put everything back (also when the retry fails). Returns the action's output
+function Invoke-WithPort80([scriptblock]$Action) {
+    try {
+        return (& $Action)
+    } catch {
+        $firstError = $_
+    }
+
+    Add-P80Note (L 'Проверка через порт 80 не прошла - ищу причину...' 'The check through port 80 failed - looking for the cause...')
+    $holders = Get-Port80Holders
+    $fw = Get-FirewallState
+    foreach ($s in $holders.Services) { Add-P80Note (L "порт 80 занят службой $s" "port 80 is held by the service $s") }
+    foreach ($o in $holders.Others)   { Add-P80Note (L "порт 80 занят процессом $o" "port 80 is held by the process $o") }
+    if (-not $holders.Busy) { Add-P80Note (L 'порт 80 свободен' 'port 80 is free') }
+    switch ($fw) {
+        'closed'  { Add-P80Note (L 'Брандмауэр Windows закрывает порт 80' 'Windows Firewall closes port 80') }
+        'open'    { Add-P80Note (L 'Брандмауэр Windows пропускает порт 80' 'Windows Firewall lets port 80 through') }
+        'unknown' { Add-P80Note (L 'правила брандмауэра прочитать не удалось (нужны права администратора)' 'could not read the firewall rules (administrator rights needed)') }
+    }
+    if (-not $holders.Busy -and $fw -ne 'closed') {
+        Add-P80Note (L 'на этом компьютере порту 80 ничего не мешает: вероятно, его закрывает внешний фаервол (облако, роутер, провайдер) или домен указывает на другой адрес' `
+                       'nothing on this computer blocks port 80: most likely an outside firewall (cloud, router, provider) closes it, or the domain points to another address')
+        throw $firstError
+    }
+
+    # what was changed, to put it back
+    $stopped = @()
+    $ruleAdded = $false
+    $changed = $false
+    try {
+        if ($holders.Busy) {
+            if (-not $script:Cfg.FixStop) {
+                Add-P80Note (L 'останавливать службы запрещено в настройках' 'stopping services is turned off in the settings')
+            } elseif ($holders.Others.Count -gt 0) {
+                # without a service there is no reliable way to start it again
+                Add-P80Note (L 'это не служба - мастер не останавливает её, потому что не сможет запустить обратно' `
+                               'it is not a service - the wizard leaves it alone, as it could not start it again')
+            } else {
+                foreach ($name in $holders.Services) {
+                    # stopping a service stops the services that depend on it; start those too
+                    $dependents = @(Get-Service -Name $name).DependentServices | Where-Object { $_.Status -eq 'Running' } |
+                                  ForEach-Object { $_.Name }
+                    try {
+                        Stop-Service -Name $name -Force -ErrorAction Stop
+                        $stopped += @{ Name = $name; Dependents = @($dependents) }
+                        Add-P80Note (L "служба $name остановлена на время проверки" "service $name stopped for the check")
+                    } catch {
+                        Add-P80Note (L "не удалось остановить службу ${name}: $($_.Exception.Message)" "could not stop the service ${name}: $($_.Exception.Message)")
+                    }
+                }
+                for ($i = 0; $i -lt 10 -and (Get-Port80Holders).Busy; $i++) { Start-Sleep -Seconds 1 }
+                if ((Get-Port80Holders).Busy) { Add-P80Note (L 'порт 80 всё ещё занят' 'port 80 is still in use') }
+                else                          { $changed = $true }
+            }
+        }
+        if ($fw -eq 'closed') {
+            if (-not $script:Cfg.FixFirewall) {
+                Add-P80Note (L 'открывать порт в брандмауэре запрещено в настройках' 'opening the firewall is turned off in the settings')
+            } else {
+                try {
+                    New-NetFirewallRule -Name $script:P80RuleName -DisplayName 'ssl-wizard: Let''s Encrypt check (temporary)' `
+                        -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                    $ruleAdded = $true
+                    $changed = $true
+                    Add-P80Note (L 'порт 80 временно открыт в брандмауэре' 'port 80 temporarily opened in the firewall')
+                } catch {
+                    Add-P80Note (L "не удалось открыть порт 80: $($_.Exception.Message)" "could not open port 80: $($_.Exception.Message)")
+                }
+            }
+        }
+        if (-not $changed) { throw $firstError }
+
+        Add-P80Note (L 'Повторяю проверку...' 'Retrying the check...')
+        try {
+            return (& $Action)
+        } catch {
+            Add-P80Note (L 'проверка не прошла и после исправления: вероятно, порт 80 закрыт ещё и снаружи (облако, роутер, провайдер) или домен указывает на другой адрес' `
+                           'the check failed even after the fix: port 80 is probably also closed outside (cloud, router, provider), or the domain points to another address')
+            throw
+        }
+    } finally {
+        if ($ruleAdded) {
+            try {
+                Remove-NetFirewallRule -Name $script:P80RuleName -ErrorAction Stop
+                Add-P80Note (L 'порт 80 снова закрыт' 'port 80 closed again')
+            } catch {
+                Add-P80Note (L "НЕ удалось удалить правило $($script:P80RuleName) - удалите вручную" "could NOT remove the rule $($script:P80RuleName) - remove it by hand")
+            }
+        }
+        foreach ($s in $stopped) {
+            foreach ($name in @($s.Name) + @($s.Dependents)) {
+                try {
+                    Start-Service -Name $name -ErrorAction Stop
+                    Add-P80Note (L "служба $name снова запущена" "service $name started again")
+                } catch {
+                    Add-P80Note (L "НЕ удалось запустить службу $name - запустите вручную" "could NOT start the service $name - start it by hand")
+                }
+            }
+        }
+    }
+}
+
+# ==============================================================================
+# Settings menu
+# ==============================================================================
+function Get-OnOff([bool]$Value) { if ($Value) { return L 'вкл' 'on' } else { return L 'выкл' 'off' } }
+function Get-IsSet([string]$Value) { if ($Value) { return L 'настроено' 'configured' } else { return L 'не настроено' 'not configured' } }
+
+# "1) Set up  2) Turn off" - returns 1 / 2, 0 = back (Nav = back)
+function Read-SetupOrOff {
+    Opt 1 (L 'Настроить' 'Set up')   (L 'ввести данные' 'enter the details')
+    Opt 2 (L 'Отключить' 'Turn off') (L 'удалить настройки' 'remove the settings')
+    Blank; Hr; Blank
+    return (Read-Pick 2)
+}
+
+# Read-Setting 'prompt' 'current value' [-Secret] [check] - the new value, or $null on 0 (back)
+function Read-Setting([string]$Prompt, [string]$Current, [switch]$Secret, [scriptblock]$Check = $null) {
+    $script:S.SettingTmp = $Current
+    $script:AskSecret = [bool]$Secret
+    try { Read-Answer 'SettingTmp' $Prompt '' $Check } finally { $script:AskSecret = $false }
+    if ($script:Nav -eq 'back') { $script:Nav = ''; return $null }
+    $value = $script:S.SettingTmp
+    $script:S.SettingTmp = ''
+    return $value
+}
+
+function Step-SettingsTelegram {
+    Screen (L 'Уведомления: Telegram' 'Notifications: Telegram')
+    Row (L 'Сейчас' 'Now') (Get-IsSet $script:Cfg.TgToken)
+    Blank
+    Hint (L '1. Создайте бота у @BotFather и скопируйте его токен.' '1. Create a bot with @BotFather and copy its token.')
+    Hint (L '2. Напишите своему боту любое сообщение - мастер сам найдёт chat id.' '2. Send your bot any message - the wizard finds the chat id itself.')
+    Blank
+    $c = Read-SetupOrOff
+    if ($script:Nav -eq 'back') { $script:Nav = ''; return }
+    if ($c -eq 2) { $script:Cfg.TgToken = ''; $script:Cfg.TgChat = ''; Save-Settings; return }
+    Blank
+    $token = Read-Setting (L 'Токен бота' 'Bot token') $script:Cfg.TgToken -Secret
+    if ($null -eq $token) { return }
+    $found = ''
+    try {
+        $updates = Invoke-RestMethod "https://api.telegram.org/bot$token/getUpdates" -TimeoutSec 15 -UseBasicParsing
+        $last = @($updates.result | Where-Object { $_.message.chat.id }) | Select-Object -Last 1
+        if ($last) { $found = [string]$last.message.chat.id }
+    } catch { }
+    if ($found) { Info (L "Найден chat id: $found" "Found chat id: $found") }
+    else { Hint (L 'chat id не найден автоматически: напишите боту и повторите, или введите его сами.' 'The chat id was not found automatically: message the bot and retry, or type it in.') }
+    $chat = Read-Setting 'Chat id' $(if ($found) { $found } else { $script:Cfg.TgChat })
+    if ($null -eq $chat) { return }
+    $script:Cfg.TgToken = $token
+    $script:Cfg.TgChat = $chat
+    Save-Settings
+    Ok (L 'Сохранено.' 'Saved.')
+    Blank
+    Pause-Wizard
+}
+
+function Step-SettingsMail {
+    Screen (L 'Уведомления: e-mail' 'Notifications: e-mail')
+    Row (L 'Сейчас' 'Now') (Get-IsSet $script:Cfg.MailHost)
+    Blank
+    Hint (L 'Письма отправляются через ваш почтовый сервер (SMTP).' 'Mail is sent through your mail server (SMTP).')
+    Blank
+    $c = Read-SetupOrOff
+    if ($script:Nav -eq 'back') { $script:Nav = ''; return }
+    if ($c -eq 2) {
+        foreach ($k in 'MailHost', 'MailPort', 'MailSecurity', 'MailUser', 'MailPass', 'MailFrom', 'MailTo') { $script:Cfg[$k] = '' }
+        Save-Settings
+        return
+    }
+    Blank
+    $mailHost = Read-Setting (L 'SMTP-сервер' 'SMTP server') $script:Cfg.MailHost
+    if ($null -eq $mailHost) { return }
+    Blank
+    Opt 1 'STARTTLS' (L 'порт 587' 'port 587')
+    Opt 2 (L 'Без шифрования' 'No encryption') (L 'порт 25' 'port 25')
+    Hint (L 'SSL на порту 465 в Windows не поддерживается - выберите STARTTLS.' 'SSL on port 465 is not supported on Windows - choose STARTTLS.')
+    Blank
+    $s = Read-Pick 2
+    if ($script:Nav -eq 'back') { $script:Nav = ''; return }
+    $security = @('starttls', 'none')[$s - 1]
+    $port = if ($security -eq $script:Cfg.MailSecurity -and $script:Cfg.MailPort) { $script:Cfg.MailPort } else { @('587', '25')[$s - 1] }
+    $port = Read-Setting (L 'Порт' 'Port') $port
+    if ($null -eq $port) { return }
+    Hint (L "Логин и пароль: '-', если сервер не требует входа." "Login and password: '-' if the server needs no login.")
+    $user = Read-Setting (L 'Логин' 'Login') $(if ($script:Cfg.MailUser) { $script:Cfg.MailUser } else { '-' })
+    if ($null -eq $user) { return }
+    if ($user -eq '-') { $user = '' }
+    $pass = ''
+    if ($user) {
+        $pass = Read-Setting (L 'Пароль' 'Password') $script:Cfg.MailPass -Secret
+        if ($null -eq $pass) { return }
+    }
+    $from = Read-Setting (L 'От кого (адрес)' 'From (address)') $(if ($script:Cfg.MailFrom) { $script:Cfg.MailFrom } else { $user }) -Check $script:CheckEmail
+    if ($null -eq $from) { return }
+    $to = Read-Setting (L 'Кому (через запятую)' 'To (comma separated)') $script:Cfg.MailTo
+    if ($null -eq $to) { return }
+    $script:Cfg.MailHost = $mailHost; $script:Cfg.MailPort = $port; $script:Cfg.MailSecurity = $security
+    $script:Cfg.MailUser = $user; $script:Cfg.MailPass = $pass; $script:Cfg.MailFrom = $from; $script:Cfg.MailTo = $to
+    Save-Settings
+    Ok (L 'Сохранено.' 'Saved.')
+    Blank
+    Pause-Wizard
+}
+
+function Step-SettingsWebhook {
+    Screen (L 'Уведомления: webhook' 'Notifications: webhook')
+    Row (L 'Сейчас' 'Now') (Get-IsSet $script:Cfg.WebhookUrl)
+    Blank
+    Hint (L 'Мастер отправит POST с JSON: event, host, subject, text, content.' 'The wizard sends a POST with JSON: event, host, subject, text, content.')
+    Hint (L 'Подходит для Slack, Mattermost, Discord и своих сервисов.' 'Works with Slack, Mattermost, Discord and your own services.')
+    Blank
+    $c = Read-SetupOrOff
+    if ($script:Nav -eq 'back') { $script:Nav = ''; return }
+    if ($c -eq 2) { $script:Cfg.WebhookUrl = ''; Save-Settings; return }
+    Blank
+    $url = Read-Setting 'URL' $script:Cfg.WebhookUrl
+    if ($null -eq $url) { return }
+    $script:Cfg.WebhookUrl = $url
+    Save-Settings
+    Ok (L 'Сохранено.' 'Saved.')
+    Blank
+    Pause-Wizard
+}
+
+function Step-SettingsTest {
+    Blank
+    if (-not (Test-NotifyConfigured)) {
+        Warn (L 'Ни один способ уведомлений не настроен.' 'No notification channel is set up.')
+        Blank
+        Pause-Wizard
+        return
+    }
+    Info (L 'Отправляю...' 'Sending...')
+    $lines = Send-Notification (L 'ssl-wizard: проверка уведомлений' 'ssl-wizard: notification test') `
+        (L "Это тестовое сообщение с компьютера $env:COMPUTERNAME. Так будут приходить сообщения о неудачном продлении." `
+           "This is a test message from $env:COMPUTERNAME. Messages about failed renewals will arrive like this.")
+    foreach ($line in @($lines)) { if ($line -like '*: ok') { Ok $line } else { Err $line } }
+    Blank
+    Pause-Wizard
+}
+
+# Menu item "Settings"
+function Step-Settings {
+    $savedStep = $script:StepI
+    $script:StepI = 0
+    try {
+        while ($true) {
+            $c = $script:Cfg
+            Screen (L 'Настройки' 'Settings')
+            Hint (L 'Если Let''s Encrypt не может проверить домен через порт 80 (Standalone), мастер может сам:' `
+                    'When Let''s Encrypt cannot check the domain through port 80 (Standalone), the wizard may:')
+            Opt 1 (L 'Останавливать службу' 'Stop the service') `
+                  ("[$(Get-OnOff $c.FixStop)] " + (L 'которая заняла порт 80, и запускать после' 'holding port 80, and start it afterwards'))
+            Opt 2 (L 'Открывать брандмауэр' 'Open the firewall') `
+                  ("[$(Get-OnOff $c.FixFirewall)] " + (L 'временное правило для порта 80, удалять после' 'temporary rule for port 80, removed afterwards'))
+            Blank
+            Hint (L 'Куда сообщать, если автоматически продлить не получилось:' 'Where to report when an automatic renewal fails:')
+            Opt 3 'Telegram' "[$(Get-IsSet $c.TgToken)]"
+            Opt 4 'E-mail'   "[$(Get-IsSet $c.MailHost)]"
+            Opt 5 'Webhook'  "[$(Get-IsSet $c.WebhookUrl)]"
+            Opt 6 (L 'Проверить уведомления' 'Test notifications') (L 'отправить тестовое сообщение' 'send a test message')
+            Blank
+            Hint (L "Настройки хранятся в $($script:SettingsFile)" "Settings are kept in $($script:SettingsFile)")
+            Blank; Hr; Blank
+            $n = Read-Pick 6
+            if ($script:Nav -eq 'back') { break }
+            switch ($n) {
+                1 { $script:Cfg.FixStop = -not $c.FixStop; Save-Settings }
+                2 { $script:Cfg.FixFirewall = -not $c.FixFirewall; Save-Settings }
+                3 { Step-SettingsTelegram }
+                4 { Step-SettingsMail }
+                5 { Step-SettingsWebhook }
+                6 { Step-SettingsTest }
+            }
+            $script:Nav = ''
+        }
+    } finally {
+        $script:StepI = $savedStep
+        $script:Nav = ''
+    }
+}
+
 # Imports Posh-ACME on first use; only Let's Encrypt entries need it
 function Use-PoshAcme {
     if (Get-Module -Name Posh-ACME) { return }
@@ -1349,8 +1865,10 @@ function Get-AcmeScannedCert($Entry) {
     Use-PoshAcme
     $order = $null
     try { $order = Get-PAOrder -Name $Entry.Order -ErrorAction SilentlyContinue } catch { }
+    $port80 = $Entry.Plugin -eq 'WebSelfHost'
     if ($order) {
-        $cert = Submit-Renewal -Name $Entry.Order -Force -WarningAction SilentlyContinue
+        if ($port80) { $cert = Invoke-WithPort80 { Submit-Renewal -Name $Entry.Order -Force -WarningAction SilentlyContinue } }
+        else         { $cert = Submit-Renewal -Name $Entry.Order -Force -WarningAction SilentlyContinue }
     } else {
         $csr = Join-Path $script:HomeDir "$($Entry.Order).csr"
         $san = (@($Entry.Domains) | ForEach-Object { "DNS:$_" }) -join ','
@@ -1360,7 +1878,8 @@ function Get-AcmeScannedCert($Entry) {
             $params = @{ CSRPath = $csr; Name = $Entry.Order; AcceptTOS = $true; Plugin = $Entry.Plugin; Force = $true }
             $pluginArgs = Get-PluginArgs $Entry
             if ($pluginArgs.Count -gt 0) { $params.PluginArgs = $pluginArgs }
-            $cert = New-PACertificate @params
+            if ($port80) { $cert = Invoke-WithPort80 { New-PACertificate @params } }
+            else         { $cert = New-PACertificate @params }
         } finally {
             if (Test-Path -LiteralPath $csr) { [IO.File]::Delete($csr) }
         }
@@ -1406,12 +1925,19 @@ function Invoke-RenewalCore([object[]]$List) {
     foreach ($item in $List) {
         $name = if ($item.Name) { $item.Name } else { $item.Domain }
         $script:BackupSet = $null       # every certificate gets its own backup set
+        $script:P80Notes  = @()
         try {
             if (-not $item.Type) {
                 # issued by the wizard itself: Posh-ACME decides when it is due
                 # and returns nothing until then
                 Use-PoshAcme
-                $cert = Submit-Renewal -MainDomain $item.Domain -WarningAction SilentlyContinue
+                $order = $null
+                try { $order = Get-PAOrder -MainDomain $item.Domain -ErrorAction SilentlyContinue } catch { }
+                if ($order -and @($order.Plugin) -contains 'WebSelfHost') {
+                    $cert = Invoke-WithPort80 { Submit-Renewal -MainDomain $item.Domain -WarningAction SilentlyContinue }
+                } else {
+                    $cert = Submit-Renewal -MainDomain $item.Domain -WarningAction SilentlyContinue
+                }
                 if (-not $cert) {
                     Write-RenewLog ("${name}: " + (L 'продлевать ещё рано' 'not due for renewal yet'))
                     continue
@@ -1428,13 +1954,20 @@ function Invoke-RenewalCore([object[]]$List) {
                 $where = @($item.Outputs)[0].Path
             }
             $renewed++
+            if ($script:P80Notes.Count -gt 0) { Write-RenewLog ("${name}: " + ($script:P80Notes -join '; ')) }
             Write-RenewLog ("${name}: " + (L 'продлён, файлы обновлены' 'renewed, files updated') + " - $where")
             if ($script:BackupSet) {
                 Write-RenewLog ("${name}: " + (L 'старые файлы сохранены в' 'old files saved to') + " $($script:BackupSet)")
             }
         } catch {
             $failed++
-            Write-RenewLog ("${name}: " + (L 'ошибка' 'error') + " - $($_.Exception.Message)")
+            $reason = $_.Exception.Message
+            if ($script:P80Notes.Count -gt 0) { $reason = ($script:P80Notes -join '; ') + '; ' + $reason }
+            Write-RenewLog ("${name}: " + (L 'ошибка' 'error') + " - $reason")
+            if (-not $script:RenewEcho) {
+                $notes = @($script:P80Notes) + @($_.Exception.Message)
+                Send-RenewFailed $item $name ($notes -join "`n")
+            }
         }
     }
 
@@ -1446,6 +1979,10 @@ function Invoke-RenewalCore([object[]]$List) {
         } catch {
             $failed++
             Write-RenewLog ('after-renew.ps1: ' + (L 'ошибка' 'error') + " - $($_.Exception.Message)")
+            if (-not $script:RenewEcho -and (Test-NotifyConfigured)) {
+                Send-Notification (L 'ssl-wizard: after-renew.ps1 завершился с ошибкой' 'ssl-wizard: after-renew.ps1 failed') `
+                                  "$env:COMPUTERNAME: $($script:RenewHook)`n$($_.Exception.Message)" | Out-Null
+            }
         }
     }
     $script:RenewResult = @{ Renewed = $renewed; Failed = $failed }
@@ -2202,4 +2739,5 @@ function Main {
 }
 
 Load-Lang $Lang (-not $Renew)
+Load-Settings
 if ($Renew) { Invoke-Renewal } else { Main }

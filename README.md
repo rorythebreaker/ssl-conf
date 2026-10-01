@@ -139,6 +139,7 @@ No domain required; an IP address works too. Browsers will show a warning.
 |---|---|
 | Key or password | Creates only a key (RSA, ECDSA, Ed25519) or a random string (base64 / hex). No certificate is created. |
 | Scan a folder | Finds existing certificates (in subfolders too, if you want), shows when they expire and puts them on auto-renewal. See [Scanning a folder](#scanning-a-folder). |
+| Settings | Port 80 auto-fix and notifications. See [Settings](#settings). |
 | Язык / Language | Switches the interface language. |
 
 ---
@@ -191,17 +192,10 @@ You need an **API token**, not the Global API Key:
 
 ### Linux
 
-Certificates issued by the wizard: acme.sh adds a cron job during installation and renews them by itself. To have new files copied into place and nginx reloaded automatically, run once:
+After a certificate is issued (and for every certificate added by [folder scan](#scanning-a-folder)) the wizard puts it on auto-renewal: every day at 03:30 it runs `ssl-wizard --renew`, through `/etc/cron.d/ssl-wizard` or, on systems without cron, through the `ssl-wizard-renew.timer` systemd timer. When a certificate is due, it is renewed and the files in the output folder are updated — same names, same format (including `.p12`).
 
-```bash
-~/.acme.sh/acme.sh --install-cert \
-  --domain <domain> \
-  --fullchain-file /etc/ssl/custom/<domain>.crt \
-  --key-file       /etc/ssl/custom/<domain>.key \
-  --reloadcmd      "systemctl reload nginx"
-```
-
-Certificates added by [folder scan](#scanning-a-folder) are renewed by the wizard itself: every day at 03:30 it runs `ssl-wizard --renew`, through `/etc/cron.d/ssl-wizard` or, on systems without cron, through the `ssl-wizard-renew.timer` systemd timer.
+- The "Wildcard, manual DNS" method is not renewed automatically: the TXT record has to be added by hand. Run the wizard again every 2 months.
+- If the "Standalone" check fails, see [Port 80 auto-fix](#port-80-auto-fix). If renewal fails, the wizard [notifies you](#notifications).
 
 | File | What it is |
 |---|---|
@@ -223,7 +217,7 @@ After a certificate is issued, the wizard creates a scheduled task named `ssl-wi
 
 - The task runs as the user who ran the wizard, and only while that user is logged on. If the computer was off or the user was not logged on, the check runs at the next logon.
 - The "Wildcard, manual DNS" method is not renewed automatically: the TXT record has to be added by hand. Run the wizard again every 2 months.
-- The "Standalone" method briefly listens on port 80 during renewal.
+- The "Standalone" method briefly listens on port 80 during renewal. If that check fails, see [Port 80 auto-fix](#port-80-auto-fix). If renewal fails, the wizard [notifies you](#notifications).
 - Your web server will not pick up the new files by itself. Put your own script at `%LOCALAPPDATA%\ssl-wizard\after-renew.ps1` — it runs after every successful renewal. Example: `Restart-Service nginx`.
 
 Everything renewal needs lives in `%LOCALAPPDATA%\ssl-wizard`:
@@ -247,6 +241,58 @@ Turn auto-renewal off:
 
 ```powershell
 Unregister-ScheduledTask -TaskName ssl-wizard-renew -Confirm:$false
+```
+
+---
+
+## Settings
+
+**Settings** in the main menu holds two groups of options. Both are off / empty until you turn them on.
+
+| Option | What it allows |
+|---|---|
+| Stop the service | stop the service holding port 80 during a "Standalone" check, and start it again afterwards |
+| Open the firewall | open port 80 in the firewall during the check, and close it afterwards |
+| Telegram / E-mail / Webhook | where to send a message when an automatic renewal fails |
+| Test notifications | sends a test message to every channel that is set up |
+
+| System | Where settings are kept |
+|---|---|
+| Linux | `/etc/ssl-wizard/settings.conf`, readable by root only |
+| Windows | `%LOCALAPPDATA%\ssl-wizard\settings.json`; tokens and passwords are encrypted for the current Windows user |
+
+### Port 80 auto-fix
+
+The "Standalone" method needs port 80 to be free on this server and reachable from the internet. When Let's Encrypt cannot check the domain this way — on first issue or on renewal — the wizard does not give up at once:
+
+1. **Finds out why.** Who holds port 80 (a service, a Docker container, or some other process), and whether the firewall closes it: ufw, firewalld or iptables on Linux, Windows Firewall on Windows.
+2. **Fixes what the settings allow.**
+   - Port held by a service → the service is stopped (on Linux a systemd service or a Docker container; on Windows a service, including IIS).
+   - Port closed by the firewall → port 80 is opened: ufw rule, firewalld runtime rule, iptables rule, or a temporary Windows Firewall rule.
+3. **Retries the check once.**
+4. **Puts everything back**, whether the retry worked or not: the service or container is started again, the firewall rule is removed.
+
+What the wizard does not do, even with both options on:
+- It does not stop a process that is neither a service nor a container: there would be no reliable way to start it again.
+- It does not change firewalls outside the server (cloud security groups, a router, the provider). When nothing on the server blocks port 80, the wizard says that the cause is most likely there, or that the domain points to another address.
+
+Everything found and done is shown on screen, written to the renewal log, and included in the notification.
+
+### Notifications
+
+When an automatic renewal fails — including after the port 80 auto-fix — the wizard sends a message to every channel set up in **Settings**. The message says which certificate failed and on which server, how many days are left, and what happened. Failed checks are retried every day, so a message can repeat until the problem is fixed or the certificate is renewed.
+
+| Channel | What you need |
+|---|---|
+| Telegram | a bot token from @BotFather; send the bot any message and the wizard finds the chat id by itself |
+| E-mail | an SMTP server, port, login and password, sender and recipients (comma separated). Linux: SSL (465), STARTTLS (587) or no encryption. Windows: STARTTLS or no encryption — SSL on port 465 is not supported by Windows |
+| Webhook | a URL. The wizard sends a POST with JSON fields `event`, `host`, `subject`, `text` and `content` — that works with Slack, Mattermost and Discord as is |
+
+Example webhook body:
+
+```json
+{"event":"renewal_failed","host":"web-01","subject":"ssl-wizard: could not renew the certificate example.com",
+ "text":"…","content":"…"}
 ```
 
 ---

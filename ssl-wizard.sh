@@ -208,20 +208,29 @@ pick() {
 }
 
 # ask VARNAME "ru prompt" "en prompt" ["default"] [validator]
-# Enter — take the value in brackets; 0 — back (NAV=back)
+# Enter — take the value in brackets; 0 — back (NAV=back).
+# With ASK_SECRET=yes the input is not echoed and the default is shown as ***
+ASK_SECRET=""
 ask() {
     local -n __ask_ref=$1
-    local default="${4:-}" check="${5:-}" prompt in
+    local default="${4:-}" check="${5:-}" prompt in shown
     tl "$2" "$3"
     prompt="$MSG"
     [[ -n "$__ask_ref" ]] && default="$__ask_ref"
     while true; do
+        shown="$default"
+        if [[ -n "$ASK_SECRET" && -n "$default" ]]; then shown="***"; fi
         if [[ -n "$default" ]]; then
-            printf "  %s ${DIM}[%s]${R}: " "$prompt" "$default"
+            printf "  %s ${DIM}[%s]${R}: " "$prompt" "$shown"
         else
             printf "  %s: " "$prompt"
         fi
-        read -r in || exit 0
+        if [[ -n "$ASK_SECRET" ]]; then
+            read -rs in || exit 0
+            echo ""
+        else
+            read -r in || exit 0
+        fi
         in="$(trim "$in")"
         if [[ "$in" == "0" ]]; then
             NAV="back"
@@ -610,12 +619,14 @@ step_method() {
                "Key or password"      "a key or a random string only"
         opt 12 "Сканировать папку"    "найти сертификаты и поставить на автопродление" \
                "Scan a folder"        "find certificates and put them on auto-renewal"
-        opt 13 "Язык / Language"      "English" \
+        opt 13 "Настройки"            "автоисправление порта 80, уведомления" \
+               "Settings"             "port 80 auto-fix, notifications"
+        opt 14 "Язык / Language"      "English" \
                "Язык / Language"      "Русский"
         blank; hr; blank
 
         local c=""
-        pick c 13 exit
+        pick c 14 exit
         [[ "$NAV" == "back" ]] && return 0
 
         if [[ "$c" == "12" ]]; then
@@ -623,6 +634,10 @@ step_method() {
             continue
         fi
         if [[ "$c" == "13" ]]; then
+            step_settings
+            continue
+        fi
+        if [[ "$c" == "14" ]]; then
             choose_lang
             continue
         fi
@@ -1191,17 +1206,53 @@ copy_acme_files() {
     maybe_convert_p12 "${CERT_OUT}" "${KEY_OUT}"
     print_nginx_hint  "${CERT_OUT}" "${KEY_OUT}"
     blank
-    info "acme.sh будет продлевать сертификат сам. После продления скопируйте" \
-         "acme.sh renews the certificate by itself. After a renewal, copy the"
-    info "новые файлы или настройте: acme.sh --install-cert (см. README)." \
-         "new files or set up: acme.sh --install-cert (see README)."
+
+    if [[ "$S_METHOD" == "le_wildcard_manual" ]]; then
+        warn "Автопродление для этого способа невозможно: TXT-запись нужно" \
+             "Auto-renewal is not possible for this method: the TXT record has to"
+        warn "добавлять вручную. Раз в 2 месяца запускайте мастер ещё раз." \
+             "be added by hand. Run the wizard again every 2 months."
+        return 0
+    fi
+    register_wizard_renewal "$acme_dir"
+}
+
+# register_wizard_renewal ACME_DIR — puts a certificate the wizard has just got
+# from acme.sh on auto-renewal: acme.sh renews it the way it was issued, and the
+# renewal copies the new files over the ones in the output folder
+register_wizard_renewal() {
+    local acme_dir="$1"
+    reset_entry
+    E_TYPE="acme"
+    E_NAME="$S_DOMAIN"
+    E_DAYS=$(( ( $(cert_epoch "$CERT_OUT" end) - $(cert_epoch "$CERT_OUT" start) + 43200 ) / 86400 ))
+    E_KEY="$KEY_OUT"
+    E_OUTPUTS=("fullchain:${CERT_OUT}")
+    if [[ -f "${S_OUTDIR}/${S_DOMAIN}_chain.pem" ]]; then E_OUTPUTS+=("chain:${S_OUTDIR}/${S_DOMAIN}_chain.pem"); fi
+    if [[ "$S_FORMAT" == "p12" ]]; then E_P12=("${S_OUTDIR}/${S_DOMAIN}.p12"); fi
+    E_DOMAINS=("$S_DOMAIN")
+    E_ACME_MODE="existing"
+    if [[ "$S_METHOD" == "le_standalone" ]]; then E_HTTP80="yes"; fi
+
+    save_entry
+    if register_renew_task; then
+        ok "Автопродление включено: срок проверяется каждый день, файлы в этой папке" \
+           "Auto-renewal is on: the expiry is checked every day, and the files in this"
+        ok "обновляются сами (подробности в README)." \
+           "folder are updated by themselves (details in README)."
+    else
+        warn "acme.sh продлит сертификат сам, но файлы в этой папке не обновятся:" \
+             "acme.sh will renew the certificate, but the files in this folder will not"
+        warn "нет ни cron, ни systemd для ежедневной проверки." \
+             "be updated: neither cron nor systemd is available for the daily check."
+    fi
 }
 
 run_le_standalone() {
     le_domains
     info "Получаю сертификат для ${S_DOMAIN} (порт 80 должен быть свободен)…" \
          "Requesting a certificate for ${S_DOMAIN} (port 80 must be free)…"
-    acme --issue --standalone "${LE_DOMAINS[@]}" --accountemail "${S_EMAIL}"
+    with_port80 acme --issue --standalone "${LE_DOMAINS[@]}" --accountemail "${S_EMAIL}"
     copy_acme_files
 }
 
@@ -1438,6 +1489,640 @@ run_keygen() {
 }
 
 # ==============================================================================
+# Settings — DATA_DIR/settings.conf, shell assignments written with %q.
+# Root only: it holds tokens and passwords.
+# ==============================================================================
+SETTINGS_FILE="${DATA_DIR}/settings.conf"
+SET_FIX_STOP="no"           # may stop the service holding port 80 during a Standalone check
+SET_FIX_FIREWALL="no"       # may open port 80 in the firewall during a Standalone check
+SET_TG_TOKEN=""             # Telegram bot token
+SET_TG_CHAT=""              # Telegram chat id
+SET_MAIL_HOST=""
+SET_MAIL_PORT=""
+SET_MAIL_SECURITY=""        # ssl | starttls | none
+SET_MAIL_USER=""
+SET_MAIL_PASS=""
+SET_MAIL_FROM=""
+SET_MAIL_TO=""              # one or more addresses, comma separated
+SET_WEBHOOK_URL=""
+SETTINGS_VARS=(SET_FIX_STOP SET_FIX_FIREWALL SET_TG_TOKEN SET_TG_CHAT
+               SET_MAIL_HOST SET_MAIL_PORT SET_MAIL_SECURITY SET_MAIL_USER SET_MAIL_PASS
+               SET_MAIL_FROM SET_MAIL_TO SET_WEBHOOK_URL)
+
+load_settings() {
+    if [[ -f "$SETTINGS_FILE" ]]; then source "$SETTINGS_FILE"; fi
+    return 0
+}
+
+save_settings() {
+    local v
+    mkdir -p "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    {
+        echo "# ssl-wizard settings"
+        for v in "${SETTINGS_VARS[@]}"; do printf '%s=%q\n' "$v" "${!v}"; done
+    } > "$SETTINGS_FILE"
+    chmod 600 "$SETTINGS_FILE"
+}
+
+# ==============================================================================
+# Notifications — Telegram, e-mail, webhook; sent when an automatic renewal fails
+# ==============================================================================
+NOTIFY_RESULT=""        # one line per channel: "Telegram: ok" / "E-mail: error ..."
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# The message text goes to curl through a file, not the command line: no length
+# limits, no encoding surprises
+notify_telegram() {
+    local f rc=0
+    f="$(mktemp)"
+    printf '%s' "$1" > "$f"
+    curl -fsS -m 20 -o /dev/null -X POST "https://api.telegram.org/bot${SET_TG_TOKEN}/sendMessage" \
+         --data-urlencode "chat_id=${SET_TG_CHAT}" --data-urlencode "text@${f}" || rc=$?
+    rm -f "$f"
+    return "$rc"
+}
+
+# notify_email SUBJECT BODY — through curl's SMTP client; the password goes in a
+# temporary netrc file so it never shows up in the process list
+notify_email() {
+    local subject="$1" body="$2" msg netrc url rc=0 r rcpts=() args=()
+    msg="$(mktemp)"
+    netrc="$(mktemp)"
+    chmod 600 "$msg" "$netrc"
+    {
+        printf 'From: %s\r\nTo: %s\r\n' "$SET_MAIL_FROM" "$SET_MAIL_TO"
+        printf 'Subject: =?UTF-8?B?%s?=\r\n' "$(printf '%s' "$subject" | base64 | tr -d '\n')"
+        printf 'Date: %s\r\n' "$(LC_ALL=C date -R)"
+        printf 'MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n'
+        printf '%s\r\n' "${body//$'\n'/$'\r\n'}"
+    } > "$msg"
+
+    args=(-fsS -m 30 --mail-from "$SET_MAIL_FROM" --upload-file "$msg")
+    IFS=',' read -ra rcpts <<< "$SET_MAIL_TO"
+    for r in "${rcpts[@]}"; do
+        r="$(trim "$r")"
+        if [[ -n "$r" ]]; then args+=(--mail-rcpt "$r"); fi
+    done
+    case "$SET_MAIL_SECURITY" in
+        ssl)      url="smtps://${SET_MAIL_HOST}:${SET_MAIL_PORT:-465}" ;;
+        starttls) url="smtp://${SET_MAIL_HOST}:${SET_MAIL_PORT:-587}"; args+=(--ssl-reqd) ;;
+        *)        url="smtp://${SET_MAIL_HOST}:${SET_MAIL_PORT:-25}" ;;
+    esac
+    if [[ -n "$SET_MAIL_USER" ]]; then
+        printf 'machine %s login %s password %s\n' "$SET_MAIL_HOST" "$SET_MAIL_USER" "$SET_MAIL_PASS" > "$netrc"
+        args+=(--netrc-file "$netrc")
+    fi
+    curl "${args[@]}" --url "$url" || rc=$?
+    rm -f "$msg" "$netrc"
+    return "$rc"
+}
+
+# notify_webhook SUBJECT TEXT — POST JSON; "text" suits Slack/Mattermost, "content" Discord
+notify_webhook() {
+    local subject text f rc=0
+    subject="$(json_escape "$1")"
+    text="$(json_escape "$2")"
+    f="$(mktemp)"
+    printf '{"event":"renewal_failed","host":"%s","subject":"%s","text":"%s\\n\\n%s","content":"%s\\n\\n%s"}' \
+        "$(json_escape "$(hostname 2>/dev/null || uname -n)")" "$subject" "$subject" "$text" "$subject" "$text" > "$f"
+    curl -fsS -m 20 -o /dev/null -H 'Content-Type: application/json' --data-binary "@${f}" "$SET_WEBHOOK_URL" || rc=$?
+    rm -f "$f"
+    return "$rc"
+}
+
+notify_configured() {
+    [[ -n "$SET_TG_TOKEN" && -n "$SET_TG_CHAT" ]] || [[ -n "$SET_MAIL_HOST" && -n "$SET_MAIL_TO" ]] || [[ -n "$SET_WEBHOOK_URL" ]]
+}
+
+# notify SUBJECT TEXT — sends to every configured channel; results go to NOTIFY_RESULT
+notify() {
+    local subject="$1" text="$2" errf
+    NOTIFY_RESULT=""
+    errf="$(mktemp)"
+    if [[ -n "$SET_TG_TOKEN" && -n "$SET_TG_CHAT" ]]; then
+        if notify_telegram "${subject}"$'\n\n'"${text}" 2>"$errf"; then
+            NOTIFY_RESULT+="Telegram: ok"$'\n'
+        else
+            NOTIFY_RESULT+="Telegram: $(tl "ошибка" "error"; echo "$MSG") $(tr '\n' ' ' < "$errf")"$'\n'
+        fi
+    fi
+    if [[ -n "$SET_MAIL_HOST" && -n "$SET_MAIL_TO" ]]; then
+        if notify_email "$subject" "$text" 2>"$errf"; then
+            NOTIFY_RESULT+="E-mail: ok"$'\n'
+        else
+            NOTIFY_RESULT+="E-mail: $(tl "ошибка" "error"; echo "$MSG") $(tr '\n' ' ' < "$errf")"$'\n'
+        fi
+    fi
+    if [[ -n "$SET_WEBHOOK_URL" ]]; then
+        if notify_webhook "$subject" "$text" 2>"$errf"; then
+            NOTIFY_RESULT+="Webhook: ok"$'\n'
+        else
+            NOTIFY_RESULT+="Webhook: $(tl "ошибка" "error"; echo "$MSG") $(tr '\n' ' ' < "$errf")"$'\n'
+        fi
+    fi
+    rm -f "$errf"
+    NOTIFY_RESULT="${NOTIFY_RESULT%$'\n'}"
+    return 0
+}
+
+# notify_renew_failed CONF NOTES — the message about a renewal that did not work
+notify_renew_failed() {
+    local conf="$1" notes="$2" name first left host subject text line
+    name="$( reset_entry; source "$conf"; echo "$E_NAME" )"
+    first="$( reset_entry; source "$conf"; echo "${E_OUTPUTS[0]#*:}" )"
+    left="$(days_left "$first" 2>/dev/null || echo "?")"
+    host="$(hostname 2>/dev/null || uname -n)"
+    notify_configured || return 0
+
+    tl "ssl-wizard: не удалось продлить сертификат ${name}" "ssl-wizard: could not renew the certificate ${name}"
+    subject="$MSG"
+    tl "Сервер: ${host}"$'\n'"Сертификат: ${name}"$'\n'"Файл: ${first}"$'\n'"Осталось дней: ${left}"$'\n\n'"Что произошло:"$'\n'"${notes}"$'\n\n'"Следующая попытка — завтра. Журнал: ${RENEW_LOG}" \
+       "Server: ${host}"$'\n'"Certificate: ${name}"$'\n'"File: ${first}"$'\n'"Days left: ${left}"$'\n\n'"What happened:"$'\n'"${notes}"$'\n\n'"The next attempt is tomorrow. Log: ${RENEW_LOG}"
+    text="$MSG"
+    notify "$subject" "$text"
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            tl "уведомление" "notification"
+            renew_log "${name}: ${MSG} - ${line}"
+        fi
+    done <<< "$NOTIFY_RESULT"
+    return 0
+}
+
+# ==============================================================================
+# Port 80 auto-fix — when a Let's Encrypt check through port 80 (Standalone)
+# fails: find out whether a process holds the port and whether the firewall
+# closes it, fix what the settings allow, retry once, then put everything back
+# ==============================================================================
+P80_BUSY=""; P80_UNITS=(); P80_CONTAINERS=(); P80_OTHERS=()
+FW_KIND=""; FW_CLOSED=""
+P80_STOPPED_UNITS=(); P80_STOPPED_CONTAINERS=(); P80_FW_OPENED=""
+
+# Findings and actions go to stderr: on screen in the wizard, into the log
+# and the notification during a renewal
+p80_note() { echo -e "${YELLOW}  ⚠${R} $1" >&2; }
+
+# PIDs listening on TCP port 80
+port80_pids() {
+    if command -v ss &>/dev/null; then
+        ss -ltnpH 'sport = :80' 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+    elif command -v lsof &>/dev/null; then
+        lsof -nP -iTCP:80 -sTCP:LISTEN -t 2>/dev/null | sort -u
+    fi
+    return 0
+}
+
+# Name of a process
+proc_name() { cat "/proc/$1/comm" 2>/dev/null || echo "?"; }
+
+# systemd service a process belongs to ("nginx.service"), empty if none
+unit_of_pid() {
+    grep -o '[^/]*\.service' "/proc/$1/cgroup" 2>/dev/null | grep -v '^user@' | tail -n 1
+    return 0
+}
+
+firewall_diagnose() {
+    local out policy
+    FW_KIND=""
+    FW_CLOSED=""
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        FW_KIND="ufw"
+        out="$(ufw status verbose 2>/dev/null)"
+        if grep -q 'Default: allow (incoming)' <<< "$out"; then return 0; fi
+        if grep -Eq '^(([0-9]+[,:])*80([,:][0-9]+)*(/tcp)?|Nginx (Full|HTTP)|Apache( Full)?|WWW( Full)?)( \(v6\))?[[:space:]]+ALLOW' <<< "$out"; then
+            return 0
+        fi
+        FW_CLOSED="yes"
+    elif command -v firewall-cmd &>/dev/null && [[ "$(firewall-cmd --state 2>/dev/null)" == "running" ]]; then
+        FW_KIND="firewalld"
+        if firewall-cmd --query-port=80/tcp &>/dev/null || firewall-cmd --query-service=http &>/dev/null; then
+            return 0
+        fi
+        FW_CLOSED="yes"
+    elif command -v iptables &>/dev/null; then
+        out="$(iptables -S INPUT 2>/dev/null)" || return 0
+        policy="$(sed -n 's/^-P INPUT //p' <<< "$out")"
+        if [[ "$policy" == "ACCEPT" ]] && ! grep -Eq -- '-j (DROP|REJECT)' <<< "$out"; then return 0; fi
+        if grep -Eq -- '--dports? ([0-9]+[,:])*80([,:][0-9]+)*( .*)? -j ACCEPT' <<< "$out"; then return 0; fi
+        FW_KIND="iptables"
+        FW_CLOSED="yes"
+    fi
+    return 0
+}
+
+port80_diagnose() {
+    local pid name unit id ids=()
+    P80_BUSY=""; P80_UNITS=(); P80_CONTAINERS=(); P80_OTHERS=()
+    for pid in $(port80_pids); do
+        P80_BUSY="yes"
+        name="$(proc_name "$pid")"
+        unit="$(unit_of_pid "$pid")"
+        if [[ "$name" == "docker-proxy" ]] && command -v docker &>/dev/null; then
+            # a container publishes port 80: stop and start the container itself
+            mapfile -t ids < <(docker ps -q --filter publish=80 2>/dev/null)
+            for id in ${ids[@]+"${ids[@]}"}; do
+                if [[ " ${P80_CONTAINERS[*]-} " != *" ${id} "* ]]; then P80_CONTAINERS+=("$id"); fi
+            done
+        elif [[ -n "$unit" ]]; then
+            if [[ " ${P80_UNITS[*]-} " != *" ${unit} "* ]]; then P80_UNITS+=("$unit"); fi
+        else
+            P80_OTHERS+=("${name} (pid ${pid})")
+        fi
+    done
+    firewall_diagnose
+}
+
+firewall_open() {
+    case "$FW_KIND" in
+        ufw)       ufw allow 80/tcp comment 'ssl-wizard temporary' >/dev/null ;;
+        firewalld) firewall-cmd --add-port=80/tcp >/dev/null ;;     # runtime only, not --permanent
+        iptables)
+            iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment ssl-wizard -j ACCEPT || return 1
+            if command -v ip6tables &>/dev/null; then
+                ip6tables -I INPUT 1 -p tcp --dport 80 -m comment --comment ssl-wizard -j ACCEPT 2>/dev/null || true
+            fi ;;
+        *) return 1 ;;
+    esac
+}
+
+firewall_close() {
+    case "$1" in
+        ufw)       ufw delete allow 80/tcp >/dev/null ;;
+        firewalld) firewall-cmd --remove-port=80/tcp >/dev/null ;;
+        iptables)
+            iptables -D INPUT -p tcp --dport 80 -m comment --comment ssl-wizard -j ACCEPT || return 1
+            if command -v ip6tables &>/dev/null; then
+                ip6tables -D INPUT -p tcp --dport 80 -m comment --comment ssl-wizard -j ACCEPT 2>/dev/null || true
+            fi ;;
+    esac
+}
+
+# Reports what port80_diagnose found
+port80_report() {
+    local u
+    if [[ -n "$P80_BUSY" ]]; then
+        for u in ${P80_UNITS[@]+"${P80_UNITS[@]}"}; do
+            tl "порт 80 занят сервисом ${u}" "port 80 is held by the service ${u}"; p80_note "$MSG"
+        done
+        for u in ${P80_CONTAINERS[@]+"${P80_CONTAINERS[@]}"}; do
+            tl "порт 80 занят Docker-контейнером ${u}" "port 80 is held by the Docker container ${u}"; p80_note "$MSG"
+        done
+        for u in ${P80_OTHERS[@]+"${P80_OTHERS[@]}"}; do
+            tl "порт 80 занят процессом ${u}" "port 80 is held by the process ${u}"; p80_note "$MSG"
+        done
+    else
+        tl "порт 80 свободен" "port 80 is free"; p80_note "$MSG"
+    fi
+    if [[ -n "$FW_CLOSED" ]]; then
+        tl "фаервол ${FW_KIND} закрывает порт 80" "the ${FW_KIND} firewall closes port 80"; p80_note "$MSG"
+    elif [[ -n "$FW_KIND" ]]; then
+        tl "фаервол ${FW_KIND} пропускает порт 80" "the ${FW_KIND} firewall lets port 80 through"; p80_note "$MSG"
+    else
+        tl "активный фаервол (ufw, firewalld, iptables) не найден" "no active firewall (ufw, firewalld, iptables) found"; p80_note "$MSG"
+    fi
+}
+
+# port80_fix — fixes what the settings allow; succeeds if something was changed
+port80_fix() {
+    local changed="" u i
+    P80_STOPPED_UNITS=(); P80_STOPPED_CONTAINERS=(); P80_FW_OPENED=""
+
+    if [[ -n "$P80_BUSY" ]]; then
+        if [[ "$SET_FIX_STOP" != "yes" ]]; then
+            tl "останавливать сервисы запрещено в настройках" "stopping services is turned off in the settings"; p80_note "$MSG"
+        elif (( ${#P80_OTHERS[@]} > 0 )); then
+            # without a service or container there is no reliable way to start it again
+            tl "это не сервис и не контейнер — мастер не останавливает его, потому что не сможет запустить обратно" \
+               "it is neither a service nor a container — the wizard leaves it alone, as it could not start it again"
+            p80_note "$MSG"
+        else
+            for u in ${P80_UNITS[@]+"${P80_UNITS[@]}"}; do
+                if systemctl stop "$u" 2>/dev/null; then
+                    P80_STOPPED_UNITS+=("$u")
+                    tl "сервис ${u} остановлен на время проверки" "service ${u} stopped for the check"; p80_note "$MSG"
+                else
+                    tl "не удалось остановить сервис ${u}" "could not stop the service ${u}"; p80_note "$MSG"
+                fi
+            done
+            for u in ${P80_CONTAINERS[@]+"${P80_CONTAINERS[@]}"}; do
+                if docker stop "$u" >/dev/null 2>&1; then
+                    P80_STOPPED_CONTAINERS+=("$u")
+                    tl "контейнер ${u} остановлен на время проверки" "container ${u} stopped for the check"; p80_note "$MSG"
+                else
+                    tl "не удалось остановить контейнер ${u}" "could not stop the container ${u}"; p80_note "$MSG"
+                fi
+            done
+            for ((i = 0; i < 10; i++)); do
+                if [[ -z "$(port80_pids)" ]]; then break; fi
+                sleep 1
+            done
+            if [[ -z "$(port80_pids)" ]]; then
+                changed="yes"
+            else
+                tl "порт 80 всё ещё занят" "port 80 is still in use"; p80_note "$MSG"
+            fi
+        fi
+    fi
+
+    if [[ -n "$FW_CLOSED" ]]; then
+        if [[ "$SET_FIX_FIREWALL" != "yes" ]]; then
+            tl "открывать порт в фаерволе запрещено в настройках" "opening the firewall is turned off in the settings"; p80_note "$MSG"
+        elif firewall_open 2>/dev/null; then
+            P80_FW_OPENED="$FW_KIND"
+            changed="yes"
+            tl "порт 80 временно открыт в ${FW_KIND}" "port 80 temporarily opened in ${FW_KIND}"; p80_note "$MSG"
+        else
+            tl "не удалось открыть порт 80 в ${FW_KIND}" "could not open port 80 in ${FW_KIND}"; p80_note "$MSG"
+        fi
+    fi
+    [[ -n "$changed" ]]
+}
+
+# Puts back everything port80_fix changed
+port80_restore() {
+    local u
+    if [[ -n "$P80_FW_OPENED" ]]; then
+        if firewall_close "$P80_FW_OPENED" 2>/dev/null; then
+            tl "порт 80 снова закрыт в ${P80_FW_OPENED}" "port 80 closed again in ${P80_FW_OPENED}"; p80_note "$MSG"
+        else
+            tl "НЕ удалось закрыть порт 80 в ${P80_FW_OPENED} — закройте вручную" \
+               "could NOT close port 80 in ${P80_FW_OPENED} — close it by hand"; p80_note "$MSG"
+        fi
+        P80_FW_OPENED=""
+    fi
+    for u in ${P80_STOPPED_UNITS[@]+"${P80_STOPPED_UNITS[@]}"}; do
+        if systemctl start "$u" 2>/dev/null; then
+            tl "сервис ${u} снова запущен" "service ${u} started again"; p80_note "$MSG"
+        else
+            tl "НЕ удалось запустить сервис ${u} — запустите вручную" "could NOT start the service ${u} — start it by hand"; p80_note "$MSG"
+        fi
+    done
+    for u in ${P80_STOPPED_CONTAINERS[@]+"${P80_STOPPED_CONTAINERS[@]}"}; do
+        if docker start "$u" >/dev/null 2>&1; then
+            tl "контейнер ${u} снова запущен" "container ${u} started again"; p80_note "$MSG"
+        else
+            tl "НЕ удалось запустить контейнер ${u} — запустите вручную" "could NOT start the container ${u} — start it by hand"; p80_note "$MSG"
+        fi
+    done
+    P80_STOPPED_UNITS=()
+    P80_STOPPED_CONTAINERS=()
+    return 0
+}
+
+# with_port80 COMMAND... — runs a Let's Encrypt command that checks the domain
+# through port 80. If it fails: diagnose, fix what the settings allow, retry
+# once, then put everything back (also if the retry fails or the script dies)
+with_port80() {
+    local rc=0
+    if "$@"; then return 0; fi
+
+    tl "Проверка через порт 80 не прошла — ищу причину…" "The check through port 80 failed — looking for the cause…"
+    p80_note "$MSG"
+    port80_diagnose
+    port80_report
+    if [[ -z "$P80_BUSY" && -z "$FW_CLOSED" ]]; then
+        tl "на этом сервере порту 80 ничего не мешает: вероятно, его закрывает внешний фаервол (облако, роутер, провайдер) или домен указывает на другой адрес" \
+           "nothing on this server blocks port 80: most likely an outside firewall (cloud, router, provider) closes it, or the domain points to another address"
+        p80_note "$MSG"
+        return 1
+    fi
+    if ! port80_fix; then
+        port80_restore
+        return 1
+    fi
+
+    trap port80_restore EXIT
+    tl "Повторяю проверку…" "Retrying the check…"
+    p80_note "$MSG"
+    "$@" || rc=$?
+    port80_restore
+    trap - EXIT
+    if (( rc != 0 )); then
+        tl "проверка не прошла и после исправления: вероятно, порт 80 закрыт ещё и снаружи (облако, роутер, провайдер) или домен указывает на другой адрес" \
+           "the check failed even after the fix: port 80 is probably also closed outside (cloud, router, provider), or the domain points to another address"
+        p80_note "$MSG"
+    fi
+    return "$rc"
+}
+
+# ==============================================================================
+# Settings menu
+# ==============================================================================
+onoff() {
+    if [[ "$1" == "yes" ]]; then tl "вкл" "on"; else tl "выкл" "off"; fi
+    echo "$MSG"
+}
+
+is_set() {
+    if [[ -n "$1" ]]; then tl "настроено" "configured"; else tl "не настроено" "not configured"; fi
+    echo "$MSG"
+}
+
+# settings_off_menu — "1) Set up  2) Turn off"; PICKED gets 1 / 2, NAV=back on 0
+settings_off_menu() {
+    opt 1 "Настроить" "ввести данные"      "Set up"   "enter the details"
+    opt 2 "Отключить" "удалить настройки"  "Turn off" "remove the settings"
+    blank; hr; blank
+    PICKED=""
+    pick PICKED 2
+}
+
+settings_telegram() {
+    local token chat found
+    screen "Уведомления: Telegram" "Notifications: Telegram"
+    row "Сейчас" "Now" "$(is_set "$SET_TG_TOKEN")"
+    blank
+    hint "1. Создайте бота у @BotFather и скопируйте его токен." "1. Create a bot with @BotFather and copy its token."
+    hint "2. Напишите своему боту любое сообщение — мастер сам найдёт chat id." \
+         "2. Send your bot any message — the wizard finds the chat id itself."
+    blank
+    settings_off_menu
+    [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    if [[ "$PICKED" == "2" ]]; then
+        SET_TG_TOKEN=""; SET_TG_CHAT=""
+        save_settings
+        return 0
+    fi
+    blank
+    token="$SET_TG_TOKEN"
+    ASK_SECRET="yes"
+    ask token "Токен бота" "Bot token"
+    ASK_SECRET=""
+    [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    # the last chat that wrote to the bot
+    found="$(curl -fsS -m 15 "https://api.telegram.org/bot${token}/getUpdates" 2>/dev/null |
+             grep -o '"chat":{"id":-\{0,1\}[0-9]*' | tail -n 1 | grep -o -- '-\{0,1\}[0-9]*$')"
+    chat="${found:-$SET_TG_CHAT}"
+    if [[ -n "$found" ]]; then
+        info "Найден chat id: ${found}" "Found chat id: ${found}"
+    else
+        hint "chat id не найден автоматически: напишите боту и повторите, или введите его сами." \
+             "The chat id was not found automatically: message the bot and retry, or type it in."
+    fi
+    ask chat "Chat id" "Chat id" "$chat"
+    [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    SET_TG_TOKEN="$token"
+    SET_TG_CHAT="$chat"
+    save_settings
+    ok "Сохранено." "Saved."
+    blank
+    pause
+}
+
+settings_email() {
+    local host port sec="" user pass from to c=""
+    screen "Уведомления: e-mail" "Notifications: e-mail"
+    row "Сейчас" "Now" "$(is_set "$SET_MAIL_HOST")"
+    blank
+    hint "Письма отправляются через ваш почтовый сервер (SMTP)." "Mail is sent through your mail server (SMTP)."
+    blank
+    settings_off_menu
+    [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    if [[ "$PICKED" == "2" ]]; then
+        SET_MAIL_HOST=""; SET_MAIL_PORT=""; SET_MAIL_SECURITY=""; SET_MAIL_USER=""
+        SET_MAIL_PASS=""; SET_MAIL_FROM=""; SET_MAIL_TO=""
+        save_settings
+        return 0
+    fi
+    blank
+    host="$SET_MAIL_HOST"
+    ask host "SMTP-сервер" "SMTP server" "" ; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    blank
+    opt 1 "SSL/TLS"  "порт 465"                  "SSL/TLS"  "port 465"
+    opt 2 "STARTTLS" "порт 587"                  "STARTTLS" "port 587"
+    opt 3 "Без шифрования" "порт 25"             "No encryption" "port 25"
+    blank
+    pick c 3; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    case "$c" in 1) sec="ssl"; port="465" ;; 2) sec="starttls"; port="587" ;; 3) sec="none"; port="25" ;; esac
+    if [[ "$sec" == "$SET_MAIL_SECURITY" && -n "$SET_MAIL_PORT" ]]; then port="$SET_MAIL_PORT"; fi
+    ask port "Порт" "Port" "$port"; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    hint "Логин и пароль: «-», если сервер не требует входа." "Login and password: \"-\" if the server needs no login."
+    user="${SET_MAIL_USER:--}"
+    ask user "Логин" "Login" "$user"; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    [[ "$user" == "-" ]] && user=""
+    pass="$SET_MAIL_PASS"
+    if [[ -n "$user" ]]; then
+        ASK_SECRET="yes"
+        ask pass "Пароль" "Password"
+        ASK_SECRET=""
+        [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    else
+        pass=""
+    fi
+    from="${SET_MAIL_FROM:-$user}"
+    ask from "От кого (адрес)" "From (address)" "$from" v_email; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    to="$SET_MAIL_TO"
+    ask to "Кому (через запятую)" "To (comma separated)" "$to"; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+
+    SET_MAIL_HOST="$host"; SET_MAIL_PORT="$port"; SET_MAIL_SECURITY="$sec"
+    SET_MAIL_USER="$user"; SET_MAIL_PASS="$pass"; SET_MAIL_FROM="$from"; SET_MAIL_TO="$to"
+    save_settings
+    ok "Сохранено." "Saved."
+    blank
+    pause
+}
+
+settings_webhook() {
+    local url
+    screen "Уведомления: webhook" "Notifications: webhook"
+    row "Сейчас" "Now" "$(is_set "$SET_WEBHOOK_URL")"
+    blank
+    hint "Мастер отправит POST с JSON: event, host, subject, text, content." \
+         "The wizard sends a POST with JSON: event, host, subject, text, content."
+    hint "Подходит для Slack, Mattermost, Discord и своих сервисов." \
+         "Works with Slack, Mattermost, Discord and your own services."
+    blank
+    settings_off_menu
+    [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    if [[ "$PICKED" == "2" ]]; then
+        SET_WEBHOOK_URL=""
+        save_settings
+        return 0
+    fi
+    blank
+    url="$SET_WEBHOOK_URL"
+    ask url "URL" "URL"; [[ "$NAV" == "back" ]] && { NAV=""; return 0; }
+    SET_WEBHOOK_URL="$url"
+    save_settings
+    ok "Сохранено." "Saved."
+    blank
+    pause
+}
+
+settings_test() {
+    local host line
+    blank
+    if ! notify_configured; then
+        warn "Ни один способ уведомлений не настроен." "No notification channel is set up."
+        blank
+        pause
+        return 0
+    fi
+    host="$(hostname 2>/dev/null || uname -n)"
+    tl "ssl-wizard: проверка уведомлений" "ssl-wizard: notification test"
+    local subject="$MSG"
+    tl "Это тестовое сообщение с сервера ${host}. Так будут приходить сообщения о неудачном продлении." \
+       "This is a test message from ${host}. Messages about failed renewals will arrive like this."
+    info "Отправляю…" "Sending…"
+    notify "$subject" "$MSG"
+    while IFS= read -r line; do
+        if [[ "$line" == *": ok" ]]; then ok "$line"; else err "$line"; fi
+    done <<< "$NOTIFY_RESULT"
+    blank
+    pause
+}
+
+# Menu item "Settings"
+step_settings() {
+    local saved_step=$STEP_I c
+    STEP_I=0
+    while true; do
+        screen "Настройки" "Settings"
+        hint "Если Let's Encrypt не может проверить домен через порт 80 (Standalone), мастер может сам:" \
+             "When Let's Encrypt cannot check the domain through port 80 (Standalone), the wizard may:"
+        opt 1 "Останавливать сервис" "[$(onoff "$SET_FIX_STOP")] который занял порт 80, и запускать после" \
+              "Stop the service"     "[$(onoff "$SET_FIX_STOP")] holding port 80, and start it afterwards"
+        opt 2 "Открывать фаервол"    "[$(onoff "$SET_FIX_FIREWALL")] ufw / firewalld / iptables, закрывать после" \
+              "Open the firewall"    "[$(onoff "$SET_FIX_FIREWALL")] ufw / firewalld / iptables, close afterwards"
+        blank
+        hint "Куда сообщать, если автоматически продлить не получилось:" \
+             "Where to report when an automatic renewal fails:"
+        opt 3 "Telegram" "[$(is_set "$SET_TG_TOKEN")]"      "Telegram" "[$(is_set "$SET_TG_TOKEN")]"
+        opt 4 "E-mail"   "[$(is_set "$SET_MAIL_HOST")]"     "E-mail"   "[$(is_set "$SET_MAIL_HOST")]"
+        opt 5 "Webhook"  "[$(is_set "$SET_WEBHOOK_URL")]"   "Webhook"  "[$(is_set "$SET_WEBHOOK_URL")]"
+        opt 6 "Проверить уведомления" "отправить тестовое сообщение" \
+              "Test notifications"    "send a test message"
+        blank
+        hint "Настройки хранятся в ${SETTINGS_FILE}" "Settings are kept in ${SETTINGS_FILE}"
+        blank; hr; blank
+        c=""
+        pick c 6
+        [[ "$NAV" == "back" ]] && break
+        case "$c" in
+            1) if [[ "$SET_FIX_STOP" == "yes" ]]; then SET_FIX_STOP="no"; else SET_FIX_STOP="yes"; fi; save_settings ;;
+            2) if [[ "$SET_FIX_FIREWALL" == "yes" ]]; then SET_FIX_FIREWALL="no"; else SET_FIX_FIREWALL="yes"; fi; save_settings ;;
+            3) settings_telegram ;;
+            4) settings_email ;;
+            5) settings_webhook ;;
+            6) settings_test ;;
+        esac
+        NAV=""
+    done
+    STEP_I=$saved_step
+    NAV=""
+}
+
+# ==============================================================================
 # Backups — files are copied to BACKUP_DIR before the wizard overwrites them
 # ==============================================================================
 BACKUP_SET=""           # folder of the current backup set (one per certificate)
@@ -1563,12 +2248,13 @@ rdn_value() { sed -n "s/^\(.*,\)\{0,1\}$2=\([^,]*\).*/\2/p" <<< "$1"; }
 #   E_CA_CERT E_CA_KEY (ca)
 #   E_DOMAINS=(...) E_ACME_MODE=existing|standalone|webroot|cloudflare
 #   E_WEBROOT E_CF_TOKEN (acme)
+#   E_HTTP80=yes — the domain check needs port 80 here (Standalone)
 # ==============================================================================
 reset_entry() {
     E_TYPE=""; E_NAME=""; E_DAYS=0; E_KEY=""
     E_OUTPUTS=(); E_P12=(); E_DOMAINS=()
     E_CA_CERT=""; E_CA_KEY=""
-    E_ACME_MODE=""; E_WEBROOT=""; E_CF_TOKEN=""
+    E_ACME_MODE=""; E_WEBROOT=""; E_CF_TOKEN=""; E_HTTP80=""
 }
 reset_entry
 
@@ -1616,7 +2302,7 @@ save_entry() {
         echo "# ssl-wizard auto-renewal entry"
         printf 'E_TYPE=%q\nE_NAME=%q\nE_DAYS=%q\nE_KEY=%q\n' "$E_TYPE" "$E_NAME" "$E_DAYS" "$E_KEY"
         printf 'E_CA_CERT=%q\nE_CA_KEY=%q\n' "$E_CA_CERT" "$E_CA_KEY"
-        printf 'E_ACME_MODE=%q\nE_WEBROOT=%q\nE_CF_TOKEN=%q\n' "$E_ACME_MODE" "$E_WEBROOT" "$E_CF_TOKEN"
+        printf 'E_ACME_MODE=%q\nE_WEBROOT=%q\nE_CF_TOKEN=%q\nE_HTTP80=%q\n' "$E_ACME_MODE" "$E_WEBROOT" "$E_CF_TOKEN" "$E_HTTP80"
         q_array E_OUTPUTS "${E_OUTPUTS[@]}"
         q_array E_P12     ${E_P12[@]+"${E_P12[@]}"}
         q_array E_DOMAINS ${E_DOMAINS[@]+"${E_DOMAINS[@]}"}
@@ -1697,7 +2383,11 @@ write_outputs() {
     for o in "${E_OUTPUTS[@]}"; do
         kind="${o%%:*}"
         path="${o#*:}"
-        if [[ "$kind" == "fullchain" ]]; then
+        if [[ "$kind" == "chain" ]]; then
+            # the issuer chain on its own (Let's Encrypt only)
+            [[ -n "$chain" ]] || continue
+            cat "$chain" > "${path}.sslwiz-tmp"
+        elif [[ "$kind" == "fullchain" ]]; then
             [[ -n "$full" ]] || full="$path"
             if [[ -n "$chain" ]]; then
                 cat "$new" "$chain" > "${path}.sslwiz-tmp"
@@ -1743,7 +2433,11 @@ acme_renew_entry() {
             cloudflare) export CF_Token="$E_CF_TOKEN"; args+=(--dns dns_cf) ;;
         esac
     fi
-    acme "${args[@]}"
+    if [[ "$E_ACME_MODE" == "standalone" || "$E_HTTP80" == "yes" ]]; then
+        with_port80 acme "${args[@]}"
+    else
+        acme "${args[@]}"
+    fi
 
     # acme.sh keeps EC certificates in <domain>_ecc, RSA ones in <domain>
     for dir in "${HOME}/.acme.sh/${d0}_ecc" "${HOME}/.acme.sh/${d0}"; do
@@ -1759,7 +2453,7 @@ acme_renew_entry() {
 # Runs under set -e in a subshell; RESULT_FILE gets: state / where / backup set
 renew_entry() {
     local result="$1" first="${E_OUTPUTS[0]#*:}" left tmp new chain="" args=()
-    left="$(days_left "$first")"
+    left="$(days_left "$first")" || die "не удаётся прочитать сертификат: ${first}" "cannot read the certificate: ${first}"
     if (( left > $(renew_threshold "$E_DAYS") )); then
         printf 'skipped\n%s\n' "$left" > "$result"
         return 0
@@ -1794,7 +2488,7 @@ renew_entry() {
 
 # run_renew CONF... — renews every due entry; counts go to RENEW_RENEWED / RENEW_FAILED
 run_renew() {
-    local f name rc out errf res=()
+    local f name rc out errf notes res=()
     RENEW_RENEWED=0
     RENEW_FAILED=0
     mkdir -p "$(dirname "$RENEW_LOG")"
@@ -1805,15 +2499,19 @@ run_renew() {
         : > "$out"
         ( set -e; reset_entry; source "$f"; BACKUP_SET=""; renew_entry "$out" ) 2>"$errf"
         rc=$?
+        # what the port 80 auto-fix found and did, and other messages
+        notes="$(sed 's/\x1b\[[0-9;]*m//g; s/^[[:space:]]*//' "$errf" | grep -v '^$' || true)"
         if (( rc != 0 )); then
             RENEW_FAILED=$((RENEW_FAILED + 1))
             tl "ошибка" "error"
-            renew_log "${name}: ${MSG} - $(tail -n 3 "$errf" | tr '\n' ' ')"
+            renew_log "${name}: ${MSG} - $(tr '\n' ' ' <<< "$notes")"
+            if [[ -z "$RENEW_ECHO" ]]; then notify_renew_failed "$f" "$notes"; fi
             continue
         fi
         mapfile -t res < "$out"
         if [[ "${res[0]:-}" == "renewed" ]]; then
             RENEW_RENEWED=$((RENEW_RENEWED + 1))
+            if [[ -n "$notes" ]]; then renew_log "${name}: $(tr '\n' ' ' <<< "$notes")"; fi
             tl "продлён, файлы обновлены" "renewed, files updated"
             renew_log "${name}: ${MSG} - ${res[1]:-}"
             if [[ -n "${res[2]:-}" ]]; then
@@ -1836,6 +2534,10 @@ run_renew() {
             RENEW_FAILED=$((RENEW_FAILED + 1))
             tl "ошибка" "error"
             renew_log "after-renew.sh: ${MSG}"
+            if [[ -z "$RENEW_ECHO" ]] && notify_configured; then
+                tl "ssl-wizard: after-renew.sh завершился с ошибкой" "ssl-wizard: after-renew.sh failed"
+                notify "$MSG" "$(hostname 2>/dev/null || uname -n): ${RENEW_HOOK} — ${RENEW_LOG}"
+            fi
         fi
     fi
     return 0
@@ -1868,7 +2570,7 @@ K_N=0
 K_ORDER=()
 K_NAME=(); K_TYPE=(); K_STATUS=(); K_REASON=(); K_KEYLBL=(); K_ISSUER=(); K_CANAME=()
 K_END=(); K_LEFT=(); K_DAYS=(); K_KEY=(); K_OUTPUTS=(); K_P12=(); K_DOMAINS=()
-K_CACERT=(); K_CAKEY=(); K_MODE=(); K_WEBROOT=(); K_CFTOKEN=()
+K_CACERT=(); K_CAKEY=(); K_MODE=(); K_WEBROOT=(); K_CFTOKEN=(); K_HTTP80=()
 
 v_dir() {
     [[ -d "$1" ]] && return 0
@@ -1886,7 +2588,7 @@ scan_folder() {
     K_N=0; K_ORDER=()
     K_NAME=(); K_TYPE=(); K_STATUS=(); K_REASON=(); K_KEYLBL=(); K_ISSUER=(); K_CANAME=()
     K_END=(); K_LEFT=(); K_DAYS=(); K_KEY=(); K_OUTPUTS=(); K_P12=(); K_DOMAINS=()
-    K_CACERT=(); K_CAKEY=(); K_MODE=(); K_WEBROOT=(); K_CFTOKEN=()
+    K_CACERT=(); K_CAKEY=(); K_MODE=(); K_WEBROOT=(); K_CFTOKEN=(); K_HTTP80=()
 
     while IFS= read -r f; do
         [[ -n "$f" ]] && managed["$f"]=1
@@ -1965,7 +2667,7 @@ scan_folder() {
         K_P12[k]=""
         K_DOMAINS[k]="${c_dns[i]}"
         K_CACERT[k]=""; K_CAKEY[k]=""
-        K_MODE[k]=""; K_WEBROOT[k]=""; K_CFTOKEN[k]=""
+        K_MODE[k]=""; K_WEBROOT[k]=""; K_CFTOKEN[k]=""; K_HTTP80[k]=""
 
         if [[ "${c_iss[i]}" == *"O=Let's Encrypt"* ]]; then
             K_TYPE[k]="acme"
@@ -2024,6 +2726,8 @@ scan_status() {
             for dir in "${HOME}/.acme.sh/${d0}_ecc" "${HOME}/.acme.sh/${d0}"; do
                 if [[ -f "${dir}/${d0}.key" && "$(key_spki "${dir}/${d0}.key")" == "$(key_spki "${K_KEY[k]}")" ]]; then
                     K_MODE[k]="existing"
+                    # acme.sh writes Le_Webroot='no' for certificates it checks in standalone mode
+                    if grep -q "^Le_Webroot='no'" "${dir}/${d0}.conf" 2>/dev/null; then K_HTTP80[k]="yes"; fi
                 fi
             done
         fi
@@ -2134,6 +2838,7 @@ ask_acme_method() {
                     continue
                 fi
                 K_MODE[k]="standalone"
+                K_HTTP80[k]="yes"
                 return 0 ;;
             webroot)
                 blank
@@ -2175,6 +2880,7 @@ entry_from_scan() {
         E_ACME_MODE="${K_MODE[k]}"
         E_WEBROOT="${K_WEBROOT[k]}"
         E_CF_TOKEN="${K_CFTOKEN[k]}"
+        E_HTTP80="${K_HTTP80[k]}"
     fi
 }
 
@@ -2379,12 +3085,14 @@ main() {
     if [[ "${1:-}" == "--renew" ]]; then
         load_lang noask
         require_root
+        load_settings
         run_renew_mode
         exit $?
     fi
 
     load_lang
     require_root
+    load_settings
     check_deps
 
     local i=0 c
