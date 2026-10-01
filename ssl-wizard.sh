@@ -207,6 +207,60 @@ pick() {
     done
 }
 
+# pick_many VARNAME MAX [all] — several numbers at once: "8, 9", "8 9", a range
+# "2-5", or "all" / "все". With "all" as the third argument Enter picks
+# everything. 0 — back (NAV=back). VARNAME gets the numbers, sorted, no repeats
+pick_many() {
+    local -n __pm_ref=$1
+    local max=$2 enter_all="${3:-}" in tok a b i bad your zero
+    local -A seen=()
+    if [[ -n "$enter_all" ]]; then
+        hint "Номера через запятую или пробел, диапазон: 2-5. Enter — все." \
+             "Numbers separated by commas or spaces, a range: 2-5. Enter — all of them."
+    else
+        hint "Номера через запятую или пробел, диапазон: 2-5, или «все»." \
+             "Numbers separated by commas or spaces, a range: 2-5, or \"all\"."
+    fi
+    tl "Ваш выбор" "Your choice"; your="$MSG"
+    tl "назад" "back";            zero="$MSG"
+    while true; do
+        printf "  %s [1-%d]  ${DIM}(0 — %s)${R}: " "$your" "$max" "$zero"
+        read -r in || exit 0
+        in="$(trim "$in")"
+        if [[ "$in" == "0" || "$in" == "b" || "$in" == "B" ]]; then
+            NAV="back"
+            return 0
+        fi
+        __pm_ref=()
+        seen=()
+        if [[ -z "$in" && -n "$enter_all" ]] ||
+           [[ "$in" == "all" || "$in" == "ALL" || "$in" == "все" || "$in" == "Все" || "$in" == "ВСЕ" || "$in" == "*" ]]; then
+            for ((i = 1; i <= max; i++)); do __pm_ref+=("$i"); done
+            return 0
+        fi
+        bad=""
+        for tok in ${in//[,;]/ }; do
+            if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                a=$((10#$tok)); b=$a
+            else
+                bad="yes"; break
+            fi
+            if (( a < 1 || b > max || a > b )); then bad="yes"; break; fi
+            for ((i = a; i <= b; i++)); do seen[$i]=1; done
+        done
+        if [[ -z "$bad" && ${#seen[@]} -gt 0 ]]; then
+            for ((i = 1; i <= max; i++)); do
+                if [[ -n "${seen[$i]:-}" ]]; then __pm_ref+=("$i"); fi
+            done
+            return 0
+        fi
+        warn "Введите номера от 1 до ${max}, например: 1, 3, 5-7 — или 0." \
+             "Enter numbers from 1 to ${max}, e.g. 1, 3, 5-7 — or 0."
+    done
+}
+
 # ask VARNAME "ru prompt" "en prompt" ["default"] [validator]
 # Enter — take the value in brackets; 0 — back (NAV=back).
 # With ASK_SECRET=yes the input is not echoed and the default is shown as ***
@@ -2692,14 +2746,16 @@ show_renew_list() {
     done
 }
 
-# pick_from_list VARNAME — asks for a certificate number; VARNAME gets its A_* index
+# pick_from_list VARNAME — asks for one or more certificate numbers from the list;
+# VARNAME gets their A_* indexes
 pick_from_list() {
     local -n __pfl_ref=$1
-    local n=""
-    hint "Номер сертификата из списка выше." "The certificate number from the list above."
-    pick n "$A_N"
+    local nums=() n
+    hint "Какие сертификаты? Номера из списка выше." "Which certificates? Numbers from the list above."
+    pick_many nums "$A_N"
     [[ "$NAV" == "back" ]] && return 0
-    __pfl_ref="${A_ORDER[$((n - 1))]}"
+    __pfl_ref=()
+    for n in "${nums[@]}"; do __pfl_ref+=("${A_ORDER[$((n - 1))]}"); done
 }
 
 # Prints the result of a run_renew from the menu
@@ -2720,7 +2776,7 @@ renew_summary() {
 
 # Menu item "Auto-renewal"
 step_renewals() {
-    local saved_step=$STEP_I c k sure
+    local saved_step=$STEP_I c k sure picked=() confs=()
     STEP_I=0
     while true; do
         screen "Автопродление" "Auto-renewal"
@@ -2739,10 +2795,10 @@ step_renewals() {
         blank; hr; blank
         opt 1 "Проверить все сейчас"     "продлить те, у кого подошёл срок — как ежедневная проверка" \
               "Check all now"            "renew the ones that are due — like the daily check"
-        opt 2 "Продлить сертификат"      "выбранный, сразу, независимо от срока" \
-              "Renew a certificate"      "the one you choose, right now, whatever its expiry"
-        opt 3 "Убрать из автопродления"  "файлы сертификата не трогаются" \
-              "Remove from auto-renewal" "the certificate files are left as they are"
+        opt 2 "Продлить сертификаты"     "выбранные, сразу, независимо от срока" \
+              "Renew certificates"       "the ones you choose, right now, whatever their expiry"
+        opt 3 "Убрать из автопродления"  "выбранные; файлы сертификатов не трогаются" \
+              "Remove from auto-renewal" "the ones you choose; their files are left as they are"
         blank
         c=""
         pick c 3
@@ -2757,32 +2813,43 @@ step_renewals() {
                 renew_summary ;;
             2)
                 blank
-                k=""
-                pick_from_list k
+                picked=()
+                pick_from_list picked
                 if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
                 blank
-                info "Продлеваю ${A_NAME[k]}…" "Renewing ${A_NAME[k]}…"
+                confs=()
+                for k in "${picked[@]}"; do
+                    confs+=("${A_CONF[k]}")
+                    info "Продлеваю ${A_NAME[k]}" "Renewing ${A_NAME[k]}"
+                done
+                blank
                 RENEW_ECHO="yes"
                 RENEW_FORCE="yes"
-                run_renew "${A_CONF[k]}"
+                run_renew "${confs[@]}"
                 RENEW_FORCE=""
                 RENEW_ECHO=""
                 renew_summary ;;
             3)
                 blank
-                k=""
-                pick_from_list k
+                picked=()
+                pick_from_list picked
                 if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
                 blank
-                warn "Убрать «${A_NAME[k]}» из автопродления? Файлы останутся на месте." \
-                     "Remove \"${A_NAME[k]}\" from auto-renewal? The files stay where they are."
-                opt 1 "Да, убрать" "" "Yes, remove" ""
+                warn "Убрать из автопродления (файлы останутся на месте):" \
+                     "Remove from auto-renewal (the files stay where they are):"
+                for k in "${picked[@]}"; do
+                    echo -e "      ${WHITE}${A_NAME[k]}${R}  ${DIM}${A_FIRST[k]}${R}"
+                done
+                blank
+                opt 1 "Да, убрать" "сертификатов: ${#picked[@]}" "Yes, remove" "certificates: ${#picked[@]}"
                 blank
                 sure=""
                 pick sure 1
                 if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
-                rm -f -- "${A_CONF[k]}"
-                ok "Убрано из автопродления: ${A_NAME[k]}" "Removed from auto-renewal: ${A_NAME[k]}"
+                for k in "${picked[@]}"; do
+                    rm -f -- "${A_CONF[k]}"
+                    ok "Убрано из автопродления: ${A_NAME[k]}" "Removed from auto-renewal: ${A_NAME[k]}"
+                done
                 blank
                 pause ;;
         esac
@@ -3093,6 +3160,38 @@ ask_acme_method() {
     done
 }
 
+# pick_scan_selection VARNAME — which found certificates to add, by their numbers
+# in the list; Enter — every one that can be added. Numbers that cannot be added
+# (already on auto-renewal, or not renewable) are named and skipped.
+# VARNAME gets K_* indexes; fails on 0 (back)
+pick_scan_selection() {
+    local -n __pss_ref=$1
+    local nums=() n k
+    while true; do
+        nums=()
+        pick_many nums "$K_N" all
+        [[ "$NAV" == "back" ]] && return 1
+        __pss_ref=()
+        for n in "${nums[@]}"; do
+            k="${K_ORDER[$((n - 1))]}"
+            if [[ "${K_STATUS[k]}" == "ok" ]]; then
+                __pss_ref+=("$k")
+            elif (( ${#nums[@]} < K_N )); then
+                # chosen by number, not by "all": say why it is left out
+                if [[ "${K_STATUS[k]}" == "managed" ]]; then
+                    tl "№${n} ${K_NAME[k]} — уже в автопродлении" "#${n} ${K_NAME[k]} — already on auto-renewal"
+                else
+                    tl "№${n} ${K_NAME[k]} — ${K_REASON[k]}" "#${n} ${K_NAME[k]} — ${K_REASON[k]}"
+                fi
+                warn "$MSG"
+            fi
+        done
+        if (( ${#__pss_ref[@]} > 0 )); then return 0; fi
+        warn "Среди выбранных нет сертификатов, которые можно добавить." \
+             "None of the chosen certificates can be added."
+    done
+}
+
 # E_* from scan result K
 entry_from_scan() {
     local k=$1
@@ -3169,12 +3268,11 @@ step_scan() {
             pause "Нажмите Enter, чтобы вернуться…" "Press Enter to go back…"
             continue
         fi
-        opt 1 "Добавить в автопродление" "сертификатов: ${#ready[@]}" \
-              "Add to auto-renewal"      "certificates: ${#ready[@]}"
-        blank
-        c=""
-        pick c 1
-        if [[ "$NAV" == "back" ]]; then NAV=""; continue; fi
+        # which of the found certificates to add: Enter — every one that can be added
+        tl "Какие добавить в автопродление? Можно добавить: ${#ready[@]}." \
+           "Which ones to add to auto-renewal? Can be added: ${#ready[@]}."
+        echo -e "  ${BOLD}${MSG}${R}"
+        if ! pick_scan_selection ready; then NAV=""; continue; fi
 
         # Let's Encrypt needs to know how to check each domain; 0 goes to the previous one
         acme_q=()

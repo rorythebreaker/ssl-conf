@@ -98,6 +98,9 @@ The wizard does not install `nginx`: the "Via nginx" method is meant for a serve
 | Enter | keep the value shown in square brackets |
 | `0` + Enter | **back** — to the previous step or question |
 | `0` at the first step | exit |
+| `1, 3`, `1 3`, `2-5`, `all` / `все` | where several certificates can be chosen at once: several numbers, a range, or everything |
+
+Several certificates can be chosen at once when renewing or removing them in [the auto-renewal list](#the-auto-renewal-list) and when adding them after a [folder scan](#scanning-a-folder).
 
 Files are saved to the folder you started the wizard from, or to any other folder you type in. Files that would be overwritten are [backed up](#backups) first.
 
@@ -257,8 +260,10 @@ Below the list: whether the daily check is set up, and where the renewal log is.
 | Action | What it does |
 |---|---|
 | Check all now | exactly what the daily check does: renews the certificates that are due and skips the rest |
-| Renew a certificate | renews the certificate you choose right away, whatever its expiry date — same files, same kind, with a backup of the old files |
-| Remove from auto-renewal | the certificate is no longer renewed; its files stay where they are. A folder scan can add it back |
+| Renew certificates | renews the certificates you choose right away, whatever their expiry date — same files, same kind, with a backup of the old files |
+| Remove from auto-renewal | the certificates you choose are no longer renewed; their files stay where they are. A folder scan can add them back |
+
+Both actions take one or more numbers from the list: `8, 9`, `8 9`, `6-9` or `all`.
 
 Everything a manual run does is shown on screen and written to the renewal log, just like the daily check — including the [port 80 auto-fix](#port-80-auto-fix). Notifications are not sent for manual runs: you see the result yourself.
 
@@ -323,7 +328,7 @@ Example webhook body:
 1. Enter a folder path (Enter = the current folder).
 2. Choose **With subfolders** (the folder and everything inside it) or **This folder only**. The wizard reads `.crt`, `.cer`, `.pem` and `.key` files.
 3. The wizard lists every server certificate it found: name, key type, issuer, expiry date and days left, the files it lives in, and whether it can be renewed.
-4. Choose **Add to auto-renewal**. For Let's Encrypt certificates you are asked once how the domain should be checked (Standalone, site folder or Cloudflare token). On Linux, a certificate that acme.sh already manages with the same key needs no question — acme.sh renews it the way it was issued.
+4. Choose which certificates to add: their numbers from the list (`1, 3`, `2-5`), or Enter for every one that can be added. Numbers that cannot be added are named with the reason and skipped. For Let's Encrypt certificates you are asked once how the domain should be checked (Standalone, site folder or Cloudflare token). On Linux, a certificate that acme.sh already manages with the same key needs no question — acme.sh renews it the way it was issued.
 5. If some certificates have already expired or expire soon, the wizard offers to renew them right away. The rest are renewed by the daily check (see [Let's Encrypt renewal](#lets-encrypt-renewal) for where it lives).
 
 ### What gets renewed, and how

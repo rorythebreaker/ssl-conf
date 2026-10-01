@@ -158,6 +158,45 @@ function Pause-Wizard([string]$Text = '') {
 
 # Read-Pick MAX [-Exit] - returns the number; 0 - back (Nav = back).
 # With -Exit the prompt says 0 quits the wizard.
+# Read-PickMany MAX [-EnterAll] - several numbers at once: "8, 9", "8 9", a range
+# "2-5", or "all" / "все". With -EnterAll, Enter picks everything.
+# Returns the numbers sorted, no repeats; 0 - back (Nav = back)
+function Read-PickMany([int]$Max, [switch]$EnterAll) {
+    if ($EnterAll) {
+        Hint (L 'Номера через запятую или пробел, диапазон: 2-5. Enter - все.' 'Numbers separated by commas or spaces, a range: 2-5. Enter - all of them.')
+    } else {
+        Hint (L "Номера через запятую или пробел, диапазон: 2-5, или 'все'." "Numbers separated by commas or spaces, a range: 2-5, or 'all'.")
+    }
+    $your = L 'Ваш выбор' 'Your choice'
+    $zero = L 'назад' 'back'
+    while ($true) {
+        Write-Host "  $your [1-$Max]  " -NoNewline
+        Write-Host "(0 - $zero)" -ForegroundColor DarkGray -NoNewline
+        Write-Host ': ' -NoNewline
+        $in = Read-Line
+        if ($in -eq '0' -or $in -eq 'b') {
+            $script:Nav = 'back'
+            return @()
+        }
+        if ((-not $in -and $EnterAll) -or @('all', 'все', '*') -contains $in.ToLower()) {
+            return @(1..$Max)
+        }
+        $picked = @{}
+        $bad = $false
+        foreach ($tok in ($in -split '[\s,;]+' | Where-Object { $_ })) {
+            if ($tok -match '^(\d+)-(\d+)$')  { $a = [int]$Matches[1]; $b = [int]$Matches[2] }
+            elseif ($tok -match '^\d+$')     { $a = [int]$tok; $b = $a }
+            else                             { $bad = $true; break }
+            if ($a -lt 1 -or $b -gt $Max -or $a -gt $b) { $bad = $true; break }
+            foreach ($i in $a..$b) { $picked[$i] = $true }
+        }
+        if (-not $bad -and $picked.Count -gt 0) {
+            return @($picked.Keys | Sort-Object)
+        }
+        Warn (L "Введите номера от 1 до $Max, например: 1, 3, 5-7 - или 0." "Enter numbers from 1 to $Max, e.g. 1, 3, 5-7 - or 0.")
+    }
+}
+
 function Read-Pick([int]$Max, [switch]$Exit) {
     $zero = if ($Exit) { L 'выход' 'exit' } else { L 'назад' 'back' }
     $your = L 'Ваш выбор' 'Your choice'
@@ -2114,10 +2153,10 @@ function Step-Renewals {
             Blank; Hr; Blank
             Opt 1 (L 'Проверить все сейчас' 'Check all now') `
                   (L 'продлить те, у кого подошёл срок - как ежедневная проверка' 'renew the ones that are due - like the daily check')
-            Opt 2 (L 'Продлить сертификат' 'Renew a certificate') `
-                  (L 'выбранный, сразу, независимо от срока' 'the one you choose, right now, whatever its expiry')
+            Opt 2 (L 'Продлить сертификаты' 'Renew certificates') `
+                  (L 'выбранные, сразу, независимо от срока' 'the ones you choose, right now, whatever their expiry')
             Opt 3 (L 'Убрать из автопродления' 'Remove from auto-renewal') `
-                  (L 'файлы сертификата не трогаются' 'the certificate files are left as they are')
+                  (L 'выбранные; файлы сертификатов не трогаются' 'the ones you choose; their files are left as they are')
             Blank
             $c = Read-Pick 3
             if ($script:Nav -eq 'back') { return }
@@ -2131,31 +2170,37 @@ function Step-Renewals {
             }
 
             Blank
-            Hint (L 'Номер сертификата из списка выше.' 'The certificate number from the list above.')
-            $k = Read-Pick $rows.Count
+            Hint (L 'Какие сертификаты? Номера из списка выше.' 'Which certificates? Numbers from the list above.')
+            $nums = @(Read-PickMany $rows.Count)
             if ($script:Nav -eq 'back') { $script:Nav = ''; continue }
-            $row = $rows[$k - 1]
+            $picked = @($nums | ForEach-Object { $rows[$_ - 1] })
 
             if ($c -eq 2) {
                 Blank
-                Info (L "Продлеваю $($row.Name)..." "Renewing $($row.Name)...")
+                foreach ($row in $picked) { Info (L "Продлеваю $($row.Name)" "Renewing $($row.Name)") }
+                Blank
                 $script:RenewEcho = $true
-                try { Invoke-RenewalCore @($row.Item) -Force } finally { $script:RenewEcho = $false }
+                try { Invoke-RenewalCore @($picked | ForEach-Object { $_.Item }) -Force } finally { $script:RenewEcho = $false }
                 Show-RenewSummary
                 continue
             }
 
             Blank
-            Warn (L "Убрать '$($row.Name)' из автопродления? Файлы останутся на месте." `
-                    "Remove '$($row.Name)' from auto-renewal? The files stay where they are.")
-            Opt 1 (L 'Да, убрать' 'Yes, remove')
+            Warn (L 'Убрать из автопродления (файлы останутся на месте):' 'Remove from auto-renewal (the files stay where they are):')
+            foreach ($row in $picked) {
+                Write-Host "      $($row.Name)  " -ForegroundColor White -NoNewline
+                Write-Host $row.First -ForegroundColor DarkGray
+            }
+            Blank
+            Opt 1 (L 'Да, убрать' 'Yes, remove') (L "сертификатов: $($picked.Count)" "certificates: $($picked.Count)")
             Blank
             [void](Read-Pick 1)
             if ($script:Nav -eq 'back') { $script:Nav = ''; continue }
+            $drop = @($picked | ForEach-Object { $_.Index })
             $list = @(Read-RenewList)
-            $keep = @(for ($i = 0; $i -lt $list.Count; $i++) { if ($i -ne $row.Index) { $list[$i] } })
+            $keep = @(for ($i = 0; $i -lt $list.Count; $i++) { if ($drop -notcontains $i) { $list[$i] } })
             Write-Text $script:RenewList (ConvertTo-Json -InputObject $keep -Depth 6)
-            Ok (L "Убрано из автопродления: $($row.Name)" "Removed from auto-renewal: $($row.Name)")
+            foreach ($row in $picked) { Ok (L "Убрано из автопродления: $($row.Name)" "Removed from auto-renewal: $($row.Name)") }
             Blank
             Pause-Wizard
         }
@@ -2463,6 +2508,30 @@ $script:CheckDir = {
     return $null
 }
 
+# Read-ScanSelection FOUND - which found certificates to add, by their numbers in
+# the list; Enter - every one that can be added. Numbers that cannot be added
+# (already on auto-renewal, or not renewable) are named and skipped.
+# Returns the chosen certificates; 0 - back (Nav = back)
+function Read-ScanSelection([object[]]$Found) {
+    while ($true) {
+        $nums = @(Read-PickMany $Found.Count -EnterAll)
+        if ($script:Nav -eq 'back') { return @() }
+        $chosen = @()
+        foreach ($n in $nums) {
+            $c = $Found[$n - 1]
+            if ($c.Status -eq 'ok') {
+                $chosen += $c
+            } elseif ($nums.Count -lt $Found.Count) {
+                # chosen by number, not by "all": say why it is left out
+                if ($c.Status -eq 'managed') { Warn (L "№$n $($c.Name) - уже в автопродлении" "#$n $($c.Name) - already on auto-renewal") }
+                else                         { Warn (L "№$n $($c.Name) - $($c.Reason)" "#$n $($c.Name) - $($c.Reason)") }
+            }
+        }
+        if ($chosen.Count -gt 0) { return $chosen }
+        Warn (L 'Среди выбранных нет сертификатов, которые можно добавить.' 'None of the chosen certificates can be added.')
+    }
+}
+
 # Menu item "Scan a folder": folder -> results -> domain checks -> add -> renew now
 function Step-Scan {
     $savedStep = $script:StepI
@@ -2507,9 +2576,10 @@ function Step-Scan {
                 Pause-Wizard (L 'Нажмите Enter, чтобы вернуться...' 'Press Enter to go back...')
                 continue
             }
-            Opt 1 (L 'Добавить в автопродление' 'Add to auto-renewal') (L "сертификатов: $($ready.Count)" "certificates: $($ready.Count)")
-            Blank
-            [void](Read-Pick 1)
+            # which of the found certificates to add: Enter - every one that can be added
+            Write-Host ('  ' + (L "Какие добавить в автопродление? Можно добавить: $($ready.Count)." `
+                                  "Which ones to add to auto-renewal? Can be added: $($ready.Count).")) -ForegroundColor White
+            $ready = @(Read-ScanSelection $found)
             if ($script:Nav -eq 'back') { $script:Nav = ''; continue }
 
             # Let's Encrypt needs to know how to check each domain; 0 goes to the previous one
