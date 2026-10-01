@@ -1889,9 +1889,14 @@ port80_restore() {
 # through port 80. If it fails: diagnose, fix what the settings allow, retry
 # once, then put everything back (also if the retry fails or the script dies)
 with_port80() {
-    local rc=0
     if "$@"; then return 0; fi
+    port80_fix_and_retry "$@"
+}
 
+# port80_fix_and_retry COMMAND... — the part of with_port80 after the first
+# attempt failed: diagnose, fix, retry once, put everything back
+port80_fix_and_retry() {
+    local rc=0
     tl "Проверка через порт 80 не прошла — ищу причину…" "The check through port 80 failed — looking for the cause…"
     p80_note "$MSG"
     port80_diagnose
@@ -2418,6 +2423,22 @@ write_outputs() {
     done
 }
 
+# acme_is_standalone DOMAIN — does acme.sh check this domain in standalone mode?
+# acme.sh keeps that in <domain>.conf as Le_Webroot='no' — in single or double
+# quotes, or without, and as "no,no" when there are several domains
+acme_is_standalone() {
+    local dir val part parts=()
+    for dir in "${HOME}/.acme.sh/$1_ecc" "${HOME}/.acme.sh/$1"; do
+        [[ -f "${dir}/$1.conf" ]] || continue
+        val="$(sed -n 's/^Le_Webroot=//p' "${dir}/$1.conf" | head -n 1 | tr -d "'\"")"
+        IFS=',' read -ra parts <<< "$val"
+        for part in ${parts[@]+"${parts[@]}"}; do
+            if [[ "$part" == "no" ]]; then return 0; fi
+        done
+    done
+    return 1
+}
+
 # acme_renew_entry TMPDIR — a Let's Encrypt certificate from acme.sh, requested
 # with the existing key. ACME_LEAF / ACME_CHAIN get the new files
 acme_renew_entry() {
@@ -2440,10 +2461,24 @@ acme_renew_entry() {
             cloudflare) export CF_Token="$E_CF_TOKEN"; args+=(--dns dns_cf) ;;
         esac
     fi
-    if [[ "$E_ACME_MODE" == "standalone" || "$E_HTTP80" == "yes" ]]; then
+    # Standalone is decided here, at renewal time, and not only from the entry:
+    # entries saved by older versions of the wizard have no E_HTTP80
+    if [[ "$E_ACME_MODE" == "standalone" || "$E_HTTP80" == "yes" ]] || acme_is_standalone "$d0"; then
         with_port80 acme "${args[@]}"
     else
-        acme "${args[@]}"
+        # webroot / nginx / DNS: stopping the web server would only get in the
+        # way. But if acme.sh itself says port 80 is taken, the certificate is
+        # checked in standalone mode after all - then the port 80 fix applies
+        local rc=0
+        acme "${args[@]}" 2>"${tmp}/acme.err" || rc=$?
+        cat "${tmp}/acme.err" >&2
+        if (( rc != 0 )); then
+            if grep -q 'port 80 is already used' "${tmp}/acme.err"; then
+                port80_fix_and_retry acme "${args[@]}"
+            else
+                return "$rc"
+            fi
+        fi
     fi
 
     # acme.sh keeps EC certificates in <domain>_ecc, RSA ones in <domain>
@@ -2507,7 +2542,10 @@ run_renew() {
         ( set -e; reset_entry; source "$f"; BACKUP_SET=""; renew_entry "$out" ) 2>"$errf"
         rc=$?
         # what the port 80 auto-fix found and did, and other messages
-        notes="$(sed 's/\x1b\[[0-9;]*m//g; s/^[[:space:]]*//' "$errf" | grep -v '^$' || true)"
+        # acme.sh's own chatter is cut down to the lines that say what went wrong:
+        # no timestamps, no port tables, no "add --debug" hints
+        notes="$(sed 's/\x1b\[[0-9;]*m//g; s/^[[:space:]]*//; s/^\[[^]]*\] //; s/^\(tcp port 80 is already used\).*/\1/' "$errf" |
+                 grep -Ev '^LISTEN |users:\(\(|--debug|acmesh-official/acme.sh/wiki|_on_before_issue|^[][0-9[:space:]()]*$' || true)"
         if (( rc != 0 )); then
             RENEW_FAILED=$((RENEW_FAILED + 1))
             tl "ошибка" "error"
@@ -2919,8 +2957,7 @@ scan_status() {
             for dir in "${HOME}/.acme.sh/${d0}_ecc" "${HOME}/.acme.sh/${d0}"; do
                 if [[ -f "${dir}/${d0}.key" && "$(key_spki "${dir}/${d0}.key")" == "$(key_spki "${K_KEY[k]}")" ]]; then
                     K_MODE[k]="existing"
-                    # acme.sh writes Le_Webroot='no' for certificates it checks in standalone mode
-                    if grep -q "^Le_Webroot='no'" "${dir}/${d0}.conf" 2>/dev/null; then K_HTTP80[k]="yes"; fi
+                    if acme_is_standalone "$d0"; then K_HTTP80[k]="yes"; fi
                 fi
             done
         fi
