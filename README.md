@@ -1,32 +1,92 @@
-# ssl-wizard.sh
+# ssl-wizard
 
-Interactive SSL certificate creation wizard.
-Covers Let's Encrypt via acme.sh, self-signed via openssl, and a standalone key / random string generator.
+An interactive wizard for creating SSL certificates. It asks simple questions step by step and runs the necessary commands for you.
 
----
+It can:
 
-## Requirements
+- obtain free **Let's Encrypt** certificates;
+- create **self-signed** certificates and your own certificate authority (CA);
+- generate standalone keys and random strings.
 
-| Tool | When needed | Install |
+| System | File | Let's Encrypt client |
 |---|---|---|
-| `bash` 4+ | always | — |
-| `openssl` | always | `apt install openssl` |
-| `curl` | acme.sh install | `apt install curl` |
-| `acme.sh` | Let's Encrypt methods | auto-installed by wizard |
-| `socat` | LE standalone mode | `apt install socat` |
-| `nginx` | LE nginx mode | `apt install nginx` |
+| Linux | `ssl-wizard.sh` | acme.sh |
+| Windows | `ssl-wizard.ps1` (started via `ssl-wizard.cmd`) | Posh-ACME |
 
-The wizard checks all of these at startup and reports what is missing before doing anything.
-If acme.sh is not found, it offers to install it automatically.
+The interface is available in **English and Russian**.
 
 ---
 
-## Usage
+## Running
+
+**Linux**
 
 ```bash
 chmod +x ssl-wizard.sh
 sudo ./ssl-wizard.sh
 ```
+
+**Windows** — double-click `ssl-wizard.cmd`. Or from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\ssl-wizard.ps1
+```
+
+On Windows, administrator rights are needed only for the "Standalone" method (it listens on port 80).
+
+### The `ssl-wizard` command
+
+On first run the wizard adds itself to `PATH`, so afterwards it starts from any folder:
+
+```bash
+sudo ssl-wizard        # Linux
+```
+
+```powershell
+ssl-wizard             # Windows, in a new terminal window
+```
+
+| System | What is installed | PATH change |
+|---|---|---|
+| Linux | a copy of the script at `/usr/local/bin/ssl-wizard` (`/usr/bin/ssl-wizard` if sudo's PATH has no `/usr/local/bin`) | none needed |
+| Windows | a launcher at `%LOCALAPPDATA%\ssl-wizard\bin\ssl-wizard.cmd` and a copy of the script next to it | `%LOCALAPPDATA%\ssl-wizard\bin` is appended to the user's `PATH` |
+
+The command runs a copy, so the downloaded files can be moved or deleted. Running a newer `ssl-wizard.sh` / `ssl-wizard.ps1` refreshes the copy.
+
+To keep the wizard off `PATH`, set `SSLWIZ_NO_PATH=1` before running it. To undo: delete the file on Linux; on Windows remove the `bin` folder from the user `PATH` (Settings → Environment Variables).
+
+---
+
+## Language
+
+On first run the wizard asks which language to use and remembers the answer. To switch later, choose **Язык / Language** in the main menu.
+
+You can also set the language without the prompt:
+
+| System | How | Where the choice is stored |
+|---|---|---|
+| Linux | `sudo SSLWIZ_LANG=en ./ssl-wizard.sh` | `~/.ssl-wizard-lang` |
+| Windows | `ssl-wizard.cmd -Lang en` or the `SSLWIZ_LANG` environment variable | `%LOCALAPPDATA%\ssl-wizard\lang.txt` |
+
+Accepted values are `en` and `ru`.
+
+---
+
+## Components install themselves
+
+On first run the wizard checks what is installed and adds anything missing without asking.
+
+| System | What is installed | Where |
+|---|---|---|
+| Linux | `openssl`, `curl`, `socat` — via the package manager (apt, dnf, yum, pacman, apk, zypper); `acme.sh` — via its official installer | system-wide; acme.sh goes to `~/.acme.sh/` |
+| Windows | OpenSSL (portable build, verified by SHA-256), the Posh-ACME module | `%LOCALAPPDATA%\ssl-wizard` |
+
+If OpenSSL or Posh-ACME is already present on the system, the wizard uses it and downloads nothing.
+On Windows the components folder can be changed with the `SSLWIZ_HOME` environment variable.
+
+If something cannot be installed (for example, there is no internet connection), the wizard says so. Self-signed certificates need only OpenSSL. The installation log on Linux is `/tmp/ssl-wizard-install.log`.
+
+The wizard does not install `nginx`: the "Via nginx" method is meant for a server that is already set up.
 
 ---
 
@@ -34,200 +94,80 @@ sudo ./ssl-wizard.sh
 
 | Input | Effect |
 |---|---|
-| number + Enter | select option |
-| `b` + Enter | go back to previous step |
-| `0` + Enter | exit (step 1 only) |
+| number + Enter | select an option |
+| Enter | keep the value shown in square brackets |
+| `0` + Enter | **back** — to the previous step or question |
+| `0` at the first step | exit |
 
-Step 1 has no back — type `0` to exit instead.
+Files are saved to the folder you started the wizard from, or to any other folder you type in. Files that would be overwritten are [backed up](#backups) first.
+
+You can go back from any step, including the review screen. Answers you already gave are kept and offered as defaults.
+
+If certificate creation fails, the wizard stays open: you can go back, fix the details and try again.
 
 ---
 
 ## Methods
 
-### Step 1 — choose a method
+### Let's Encrypt — free, trusted by browsers
 
-**Let's Encrypt** — free, publicly trusted, valid 90 days, requires a real domain (not an IP):
+Requires your own domain that already points to this server. The certificate is valid for 90 days. Not issued for IP addresses.
 
-| # | Method | What happens |
-|---|---|---|
-| 1 | Standalone | acme.sh binds port 80 directly. Requires `socat`. nginx must not be running on port 80. |
-| 2 | Webroot | nginx stays running. acme.sh writes a challenge file to the webroot you specify. |
-| 3 | nginx mode | acme.sh handles nginx reload automatically. nginx must be installed. |
-| 4 | Wildcard — manual DNS | acme.sh outputs a TXT record value. You add it to DNS manually, then complete issuance. |
-| 5 | Wildcard — Cloudflare | Fully automated via Cloudflare API token. No manual DNS edits needed. |
+| Method | When to choose it |
+|---|---|
+| Standalone | Port 80 is free, no web server is running. |
+| Via site folder | The site is already running and cannot be stopped. The wizard places a verification file in the site folder. |
+| Via nginx *(Linux only)* | nginx is installed and serves this domain. |
+| Wildcard, manual DNS | You need a certificate for `*.domain`. The wizard shows a TXT record; you add it to DNS and press Enter. |
+| Wildcard, Cloudflare | Same, but the record is added automatically using a Cloudflare API token. |
 
-**Self-signed** — openssl, no CA trust, suitable for internal services and development:
+### Self-signed — for testing and internal networks
 
-| # | Method | What happens |
-|---|---|---|
-| 6 | Simple — no passphrase | Three commands: `genrsa` → `req` → `x509`. Minimal input, no config file. |
-| 7 | RSA | Full self-signed with SAN config. Choose key size. |
-| 8 | ECDSA | Full self-signed with SAN config. Choose curve. |
-| 9 | Ed25519 | Full self-signed with SAN config. Fixed algorithm. |
-| 10 | Local CA + signed | Create a root CA, then sign a server cert with it. Install the CA once on clients — no more browser warnings for any cert signed by it. |
+No domain required; an IP address works too. Browsers will show a warning.
 
-**Utilities:**
+| Method | When to choose it |
+|---|---|
+| Quick | You need a certificate right now: 3 questions. No SAN — modern browsers may reject it. |
+| RSA | Works everywhere. Pick this if unsure. |
+| ECDSA | Shorter, faster key for modern systems. |
+| Ed25519 | The newest algorithm. Browsers do not support such certificates. |
+| Own authority (CA) | Creates your own CA and a certificate signed by it. Install `ca.crt` on your computers once and the warnings disappear. |
 
-| # | Method | What happens |
-|---|---|---|
-| 11 | Key / random generator | Generate a standalone key or random byte string. No certificate is created. |
+### Other
 
----
-
-## Steps walkthrough
-
-### Let's Encrypt methods (1–5)
-
-**Steps: Method → Format → Variables → Output dir → Summary**
-
-Variables asked:
-- Domain name (no www)
-- Contact email — used by acme.sh to register an ACME account
-- Webroot path — only for method 2
-- Cloudflare API token — only for method 5
-
-Output format choice (step 2) affects file naming only — acme.sh always writes PEM internally.
+| Method | What it does |
+|---|---|
+| Key or password | Creates only a key (RSA, ECDSA, Ed25519) or a random string (base64 / hex). No certificate is created. |
+| Scan a folder | Finds existing certificates (in subfolders too, if you want), shows when they expire and puts them on auto-renewal. See [Scanning a folder](#scanning-a-folder). |
+| Язык / Language | Switches the interface language. |
 
 ---
 
-### Simple self-signed (method 6)
+## File formats
 
-**Steps: Method → Variables → Output dir → Summary**
+| Option | Files |
+|---|---|
+| Regular | `<domain>.crt` + `<domain>.key` |
+| fullchain + privkey | `<domain>_fullchain.pem` + `<domain>_privkey.pem` |
+| PKCS#12 | `<domain>.crt` + `<domain>.key` + `<domain>.p12` (no password) |
 
-No format selection, no openssl.cnf generated.
+The contents of `.crt` and `_fullchain.pem` are identical — only the names differ. For your own CA, `_fullchain.pem` contains the server certificate followed by the CA certificate.
 
-Variables asked:
-- RSA key size: `2048` / `3072` / `4096`
-- Domain or IP address
-- Validity in days (default: `365`)
+Additional files that appear in the folder:
 
-Runs exactly these three commands:
-```bash
-openssl genrsa -out privkey.pem <bits>
-openssl req -new -key privkey.pem -out cert.csr -subj "/CN=<domain>"
-openssl x509 -req -days <days> -in cert.csr -signkey privkey.pem -out fullchain.pem
-```
+| Method | Files |
+|---|---|
+| Let's Encrypt | `<domain>_chain.pem` — the issuing authority's chain |
+| Quick | `privkey.pem`, `cert.csr`, `fullchain.pem` (no format choice) |
+| RSA / ECDSA / Ed25519 | `openssl.cnf` — the settings the certificate was created with |
+| Own authority (CA) | `ca.key` (keep secret), `ca.crt` (distribute to clients), `<domain>.csr`, `openssl.cnf` |
+| Key or password | `key_rsa<bits>.pem`, `key_ecdsa_<curve>.pem`, `key_ed25519.pem` or `rand_<n>bytes.<format>` |
 
----
+If the chosen folder already contains `ca.key` and `ca.crt`, the wizard does not create a new CA and signs the certificate with the existing one.
 
-### RSA / ECDSA / Ed25519 self-signed (methods 7–9)
+Access to key files is restricted: `chmod 600` on Linux; owner, Administrators and SYSTEM only on Windows.
 
-**Steps: Method → Format → Variables → Output dir → Summary**
-
-Variables asked:
-- Domain or IP address
-- Country code (2 letters)
-- State / Region
-- City
-- Organisation name
-- Department / Unit
-- Validity in days (default: `398`)
-- RSA key size — method 7 only: `2048` / `3072` / `4096`
-- ECDSA curve — method 8 only: `P-256` / `P-384` / `P-521`
-
-Generates `openssl.cnf` with Subject Alternative Names automatically.
-For IP addresses the SAN is written as `IP.1` — no manual editing needed.
-
----
-
-### Local CA + signed cert (method 10)
-
-**Steps: Method → Format → Variables → Output dir → Summary**
-
-Same variables as RSA/ECDSA/Ed25519 plus:
-- CA key passphrase: with or without
-
-Three internal steps:
-1. Generate root CA key and self-signed CA certificate (valid 10 years)
-2. Generate server key and CSR
-3. Sign server CSR with the CA
-
-After completion the wizard prints instructions for installing `ca.crt` into trust stores on Linux, Windows, and macOS.
-
----
-
-### Key / random generator (method 11)
-
-**Steps: Method → Algorithm → Output dir → Summary**
-
-No certificate is created. Choose an algorithm:
-
-| Algorithm | Parameters | Output file |
-|---|---|---|
-| RSA | key size: 2048 / 3072 / 4096 | `key_rsa<bits>.pem` |
-| ECDSA | curve: P-256 / P-384 / P-521 | `key_ecdsa_<curve>.pem` |
-| Ed25519 | none | `key_ed25519.pem` |
-| Random bytes | format: base64 / hex; length in bytes | `rand_<n>bytes.<format>` |
-
-For RSA, ECDSA, and Ed25519 the public key is also printed to the terminal after generation.
-For random bytes the string is printed to the terminal and saved to the output file.
-
-Random bytes examples:
-```bash
-openssl rand -base64 48   # 48 bytes → 64-char base64 string
-openssl rand -hex 32      # 32 bytes → 64-char hex string
-```
-
----
-
-## Output files
-
-### Let's Encrypt (methods 1–5)
-
-acme.sh stores certificates in `~/.acme.sh/<domain>/`.
-The wizard copies them to your chosen output directory.
-
-```
-<outdir>/
-  <domain>_fullchain.pem    ← ssl_certificate
-  <domain>_privkey.pem      ← ssl_certificate_key
-  <domain>_chain.pem        ← ssl_trusted_certificate (if available)
-  <domain>.p12              ← only if PKCS#12 format selected
-```
-
----
-
-### Simple self-signed (method 6)
-
-```
-<outdir>/
-  privkey.pem               ← ssl_certificate_key
-  cert.csr                  ← intermediate file, can be deleted after
-  fullchain.pem             ← ssl_certificate
-```
-
----
-
-### RSA / ECDSA / Ed25519 self-signed (methods 7–9)
-
-```
-<outdir>/
-  <domain>.key              ← ssl_certificate_key
-  <domain>.crt              ← ssl_certificate
-  openssl.cnf               ← generated SAN config
-  <domain>.p12              ← only if PKCS#12 format selected
-```
-
----
-
-### Local CA (method 10)
-
-```
-<outdir>/
-  ca.key                    ← keep safe, needed to sign future certs
-  ca.crt                    ← distribute to client trust stores
-  <domain>.key              ← ssl_certificate_key
-  <domain>.csr              ← intermediate file, can be deleted after
-  <domain>.crt              ← ssl_certificate
-  openssl.cnf               ← generated SAN config
-  <domain>.p12              ← only if PKCS#12 format selected
-```
-
----
-
-## nginx directives
-
-After every successful certificate creation the wizard prints ready-to-paste nginx lines:
+After creation the wizard prints ready-to-paste nginx lines:
 
 ```nginx
 ssl_certificate     /path/to/cert;
@@ -236,117 +176,170 @@ ssl_certificate_key /path/to/key;
 
 ---
 
-## Output formats
+## Cloudflare token
 
-| # | Format | Files |
-|---|---|---|
-| 1 | PEM | `<domain>.crt` + `<domain>.key` |
-| 2 | PEM bundle | `<domain>_fullchain.pem` + `<domain>_privkey.pem` |
-| 3 | PKCS#12 | `<domain>.p12` — no password by default |
+You need an **API token**, not the Global API Key:
 
-> Not available for method 6 (Simple) and method 11 (Key generator).
-
----
-
-## Passphrase behaviour
-
-| Method | CA key | Server key |
-|---|---|---|
-| Simple (6) | — | no passphrase |
-| RSA (7) | — | no passphrase |
-| ECDSA (8) | — | no passphrase |
-| Ed25519 (9) | — | no passphrase |
-| Local CA (10) | your choice at step 3 | no passphrase |
-| Key generator (11) | — | no passphrase |
-
-Keys without a passphrase load automatically when nginx starts.
-A CA key with a passphrase must be entered manually each time you sign a new certificate.
-
----
-
-## Let's Encrypt — Cloudflare wildcard (method 5)
-
-Uses the `dns_cf` plugin built into acme.sh. Requires a Cloudflare **API token** (not the global API key).
-
-How to create a token:
-1. Cloudflare dashboard → My Profile → API Tokens
-2. Create Token → Edit zone DNS (template)
+1. Cloudflare → My Profile → API Tokens
+2. Create Token → "Edit zone DNS" template
 3. Zone Resources → your domain
 4. Copy the token and paste it when the wizard asks
 
-The token is passed as the `CF_Token` environment variable and is not stored anywhere.
-
 ---
 
-## Let's Encrypt — manual DNS wildcard (method 4)
+## Let's Encrypt renewal
 
-acme.sh outputs a TXT record value and pauses. Add the record to your DNS:
+### Linux
 
-| Field | Value |
-|---|---|
-| Type | `TXT` |
-| Name | `_acme-challenge.<domain>` |
-| Value | shown by acme.sh |
-
-After the record propagates, complete issuance by running:
-
-```bash
-~/.acme.sh/acme.sh --renew \
-  --domain <domain> \
-  --yes-I-know-dns-manual-mode-enough-go-ahead-please
-```
-
----
-
-## Let's Encrypt — auto-renewal
-
-acme.sh installs a cron job automatically during setup:
-
-```
-0 0 * * * ~/.acme.sh/acme.sh --cron --home ~/.acme.sh > /dev/null
-```
-
-To reload nginx automatically after each renewal, run once after issuance:
+Certificates issued by the wizard: acme.sh adds a cron job during installation and renews them by itself. To have new files copied into place and nginx reloaded automatically, run once:
 
 ```bash
 ~/.acme.sh/acme.sh --install-cert \
   --domain <domain> \
-  --cert-file      /etc/ssl/custom/<domain>.crt \
+  --fullchain-file /etc/ssl/custom/<domain>.crt \
   --key-file       /etc/ssl/custom/<domain>.key \
-  --fullchain-file /etc/ssl/custom/<domain>_fullchain.pem \
   --reloadcmd      "systemctl reload nginx"
 ```
 
-Test renewal without making changes:
+Certificates added by [folder scan](#scanning-a-folder) are renewed by the wizard itself: every day at 03:30 it runs `ssl-wizard --renew`, through `/etc/cron.d/ssl-wizard` or, on systems without cron, through the `ssl-wizard-renew.timer` systemd timer.
+
+| File | What it is |
+|---|---|
+| `/etc/ssl-wizard/renew.d/*.conf` | one file per certificate: what it is and which files to update |
+| `/etc/ssl-wizard/after-renew.sh` | your own script, run after every successful renewal — for example `systemctl reload nginx` |
+| `/var/log/ssl-wizard-renew.log` | log: when checks ran, what was renewed, any errors |
+
+Check renewal manually, or turn it off:
 
 ```bash
-~/.acme.sh/acme.sh --renew --domain <domain> --force --test
+sudo ssl-wizard --renew && tail -n 5 /var/log/ssl-wizard-renew.log
+sudo rm /etc/cron.d/ssl-wizard                               # cron
+sudo systemctl disable --now ssl-wizard-renew.timer          # systemd
+```
+
+### Windows
+
+After a certificate is issued, the wizard creates a scheduled task named `ssl-wizard-renew`. Every day at 03:30 it checks the expiry date and, when the certificate is due, renews it and updates the files in the same folder and in the same format (including `.p12`).
+
+- The task runs as the user who ran the wizard, and only while that user is logged on. If the computer was off or the user was not logged on, the check runs at the next logon.
+- The "Wildcard, manual DNS" method is not renewed automatically: the TXT record has to be added by hand. Run the wizard again every 2 months.
+- The "Standalone" method briefly listens on port 80 during renewal.
+- Your web server will not pick up the new files by itself. Put your own script at `%LOCALAPPDATA%\ssl-wizard\after-renew.ps1` — it runs after every successful renewal. Example: `Restart-Service nginx`.
+
+Everything renewal needs lives in `%LOCALAPPDATA%\ssl-wizard`:
+
+| File | What it is |
+|---|---|
+| `renew.log` | log: when checks ran, what was renewed, any errors |
+| `renew.json` | list of certificates and the folders they are saved to |
+| `ssl-wizard.ps1` | the copy of the wizard that the task runs |
+
+Certificates added by [folder scan](#scanning-a-folder) are renewed by the same task.
+
+Check renewal manually:
+
+```powershell
+Start-ScheduledTask -TaskName ssl-wizard-renew
+Get-Content $env:LOCALAPPDATA\ssl-wizard\renew.log -Tail 5
+```
+
+Turn auto-renewal off:
+
+```powershell
+Unregister-ScheduledTask -TaskName ssl-wizard-renew -Confirm:$false
 ```
 
 ---
 
-## Local CA — install into trust stores
+## Scanning a folder
 
-After running method 10, distribute `ca.crt` to all clients:
+**Scan a folder** in the main menu takes over certificates that already exist — made by this wizard, by hand, or by another tool. It works the same on Linux and Windows.
+
+1. Enter a folder path (Enter = the current folder).
+2. Choose **With subfolders** (the folder and everything inside it) or **This folder only**. The wizard reads `.crt`, `.cer`, `.pem` and `.key` files.
+3. The wizard lists every server certificate it found: name, key type, issuer, expiry date and days left, the files it lives in, and whether it can be renewed.
+4. Choose **Add to auto-renewal**. For Let's Encrypt certificates you are asked once how the domain should be checked (Standalone, site folder or Cloudflare token). On Linux, a certificate that acme.sh already manages with the same key needs no question — acme.sh renews it the way it was issued.
+5. If some certificates have already expired or expire soon, the wizard offers to renew them right away. The rest are renewed by the daily check (see [Let's Encrypt renewal](#lets-encrypt-renewal) for where it lives).
+
+### What gets renewed, and how
+
+The renewed certificate is written to **the same files under the same names**, and it is the same kind of certificate:
+
+| Detected kind | How it is renewed | What stays the same |
+|---|---|---|
+| Self-signed | re-signed with its own key | subject, domains / IPs (SAN), all extensions, key, key type and size, validity length |
+| Signed by your own CA | re-signed by the CA whose certificate and key are in the scanned folder | the same, plus the issuing CA |
+| Let's Encrypt | new certificate from Let's Encrypt, requested with the existing key | domains, key; the new certificate comes from Let's Encrypt |
+
+The file layout is kept as well:
+
+- a file that held one certificate gets the new certificate;
+- a file that held a chain (`fullchain.pem`) gets the new certificate on top, followed by the chain;
+- if the same certificate sits in several files (`cert.pem` and `fullchain.pem`), every file is updated;
+- a `.p12` / `.pfx` next to the certificate with the same base name and no password is rebuilt too;
+- the private key file is never touched.
+
+A certificate is renewed when a third of its validity is left, but no earlier than 30 days before expiry (a 1-year certificate — 30 days before, a 30-day one — 10 days before).
+
+### What cannot be taken over
+
+The scan shows the reason next to each such certificate:
+
+- issued by a public authority other than Let's Encrypt (for example, a commercial CA);
+- the private key is not in the folder, or it is protected by a password;
+- for certificates signed by your own CA: the CA certificate or key is not in the folder, or the CA key has a password;
+- `.p12` / `.pfx` files on their own, without the certificate and key next to them.
+
+A Cloudflare token entered during the scan is kept for the renewals: on Windows encrypted for the current user (only that user's renewal task can read it); on Linux in the certificate's file in `/etc/ssl-wizard/renew.d/`, readable by root only — the same way acme.sh keeps its own tokens.
+
+---
+
+## Backups
+
+Before the wizard overwrites any file — when a certificate is renewed, or when you create a certificate in a folder that already has files with the same names — the old files are copied to a backup folder:
+
+| System | Backup folder |
+|---|---|
+| Linux | `/var/backups/ssl-wizard/` (root only) |
+| Windows | `%LOCALAPPDATA%\ssl-wizard\backup\` (you, Administrators and SYSTEM only) |
+
+Each certificate gets its own set named by date and time, with the full original path inside it:
+
+```
+/var/backups/ssl-wizard/2026-10-01_033000/etc/nginx/ssl/example.com.crt
+%LOCALAPPDATA%\ssl-wizard\backup\2026-10-01_033000\C\ssl\example.com.crt
+```
+
+To restore, copy the file back to its original place. The wizard keeps the 30 newest sets and deletes older ones. Backups contain private keys — treat the folder accordingly. The folder scan never picks up files from it.
+
+The renewal log and the wizard's screen show where each backup was saved.
+
+---
+
+## Installing your CA on clients
+
+**Windows** (PowerShell as administrator)
+
+```powershell
+Import-Certificate -FilePath "ca.crt" -CertStoreLocation Cert:\LocalMachine\Root
+```
 
 **Debian / Ubuntu**
+
 ```bash
 cp ca.crt /usr/local/share/ca-certificates/my-ca.crt
 update-ca-certificates
 ```
 
 **RHEL / Rocky / CentOS**
+
 ```bash
 cp ca.crt /etc/pki/ca-trust/source/anchors/my-ca.crt
 update-ca-trust
 ```
 
-**Windows — PowerShell (run as Administrator)**
-```powershell
-Import-Certificate -FilePath "ca.crt" -CertStoreLocation Cert:\LocalMachine\Root
-```
-
 **macOS**
+
 ```bash
 sudo security add-trusted-cert -d -r trustRoot \
      -k /Library/Keychains/System.keychain ca.crt
@@ -356,9 +349,7 @@ sudo security add-trusted-cert -d -r trustRoot \
 
 ## Notes
 
-- The script must be run as root (`sudo`).
-- acme.sh is installed to `~/.acme.sh/` of the user running the script (root when using sudo).
-- Let's Encrypt does not issue certificates for bare IP addresses — use self-signed methods for IP-only servers.
-- For IP addresses, the wizard automatically places the IP under `IP.1` in the SAN field instead of `DNS.1`.
-- PKCS#12 files are exported without a password. To add one, edit the `maybe_convert_p12` function and change `-passout pass:` to `-passout pass:yourpassword`.
-- Method 6 (Simple) does not include Subject Alternative Names — modern browsers may show a warning. Use methods 7–9 for anything that needs SAN support.
+- `ssl-wizard.sh` must be run as root (`sudo`) and needs bash 4.3 or newer.
+- `ssl-wizard.ps1` works in Windows PowerShell 5.1 and newer.
+- All keys are created without a password so the web server can start unattended. The exception is the key of your own CA: the wizard lets you protect it with a password.
+- `.p12` files are created with an empty password.
